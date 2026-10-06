@@ -104,6 +104,14 @@
         },
         {
           "kind": "field",
+          "key": "cli.max_workers",
+          "label": "并发线程数（每阶段）",
+          "control": "int-input",
+          "defaultValue": 1,
+          "description": "并发批量处理开启时，每个阶段（检测+OCR / 翻译 / 修复 / 渲染）可同时处理的工作线程数。默认 1，与旧版单线程行为一致；调大后每阶段可并行处理多张图片，可能加快整批速度，但会增加显存/内存占用和 API 并发压力，翻译的跨页上下文顺序也可能与串联模式不同。建议 1-4。需要后端为支持该参数的 manga-translator-ui 版本（未支持时该项会被忽略）。"
+        },
+        {
+          "kind": "field",
           "key": "use_custom_api_params",
           "label": "使用自定义API参数",
           "control": "toggle + edit-custom-api-params action",

@@ -826,10 +826,11 @@ async function translateMangaBatchInBackground(entries, sourceUrl, taskId, runId
     taskId,
     runId,
   });
-  const emitPageProgress = (pageIndex, stage, state, step = '', error = '', backendSequence) => {
+  const emitPageProgress = (pageIndex, stage, state, step = '', error = '', backendSequence, serverTs) => {
     const index = Number(pageIndex);
     if (!pageIndexes.has(index)) return true;
     progressSequence += 1;
+    const serverTsSeconds = Number(serverTs);
     return postEvent({
       type: 'page-progress',
       pageIndex: index,
@@ -838,6 +839,7 @@ async function translateMangaBatchInBackground(entries, sourceUrl, taskId, runId
       step,
       sequence: progressSequence,
       ...(Number.isInteger(Number(backendSequence)) ? { backendSequence: Number(backendSequence) } : {}),
+      ...(Number.isFinite(serverTsSeconds) && serverTsSeconds > 0 ? { serverTs: Math.round(serverTsSeconds * 1000) } : {}),
       ...(error ? { error: String(error).slice(0, 600) } : {}),
     });
   };
@@ -946,6 +948,7 @@ async function translateMangaBatchInBackground(entries, sourceUrl, taskId, runId
         event.step,
         event.error,
         event.sequence,
+        event.ts,
       );
       if (!ok) throw new Error('漫画翻译页面已离开，停止回传批量结果');
       return;

@@ -1042,6 +1042,12 @@ bootstrap_personal_checkout() {{
       && [ ! -L "$checkout_root/.env" ]; then
       ln -s "$source_root/.env" "$checkout_root/.env"
     fi
+    if [ -d "$source_root/manga_translator/server/data/user_resources" ] \
+      && [ ! -e "$checkout_root/manga_translator/server/data/user_resources" ] \
+      && [ ! -L "$checkout_root/manga_translator/server/data/user_resources" ]; then
+      mkdir -p "$checkout_root/manga_translator/server/data"
+      ln -s "$source_root/manga_translator/server/data/user_resources" "$checkout_root/manga_translator/server/data/user_resources"
+    fi
   fi
   printf '%s' "$checkout_root" > "$PROJECT_ROOT_FILE"
   chmod 600 "$PROJECT_ROOT_FILE"
@@ -1110,6 +1116,7 @@ SERVER_PID=""
 GPU_INFO_B64=""
 GPU_READY=0
 PULL_DONE=0
+PULLED_PROJECT_ROOT=""
 SOURCE_UPDATED=0
 PROJECT_REVISION=""
 if [ -s "$PID_FILE" ]; then
@@ -1260,6 +1267,7 @@ PY
     printf '%s' "$PROJECT_ROOT" > "$PROJECT_ROOT_FILE"
     chmod 600 "$PROJECT_ROOT_FILE"
     PULL_DONE=1
+    PULLED_PROJECT_ROOT="$PROJECT_ROOT"
     if [ "$GPU_READY" != 1 ] || [ "$SOURCE_UPDATED" = 1 ]; then
       kill -TERM "$SERVER_PID" 2>/dev/null || true
       for ATTEMPT in $(seq 1 30); do
@@ -1309,9 +1317,9 @@ if [ "$SERVER_RUNNING" != 1 ]; then
     exit 27
   fi
   rm -f "$PID_FILE" "$NONCE_FILE"
-  PROJECT_ROOT="$(cat "$PROJECT_ROOT_FILE" 2>/dev/null || true)"
+  PROJECT_ROOT="${{PULLED_PROJECT_ROOT:-$(cat "$PROJECT_ROOT_FILE" 2>/dev/null || true)}}"
   PREFERRED_PROJECT_ROOT=/home/waas/manga-translator-ui
-  if [ -f "$PREFERRED_PROJECT_ROOT/manga_translator/__main__.py" ]; then
+  if [ -z "$PULLED_PROJECT_ROOT" ] && [ -f "$PREFERRED_PROJECT_ROOT/manga_translator/__main__.py" ]; then
     PROJECT_ROOT="$PREFERRED_PROJECT_ROOT"
   fi
   PROJECT_FILE="$PROJECT_ROOT/manga_translator/__main__.py"

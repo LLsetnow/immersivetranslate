@@ -1165,6 +1165,7 @@
       .progress-selection[data-kind="success"] { color: #72d6b0; }
       .progress-compat { flex: 0 0 auto; padding: 4px 7px; color: #f3d58a; background: rgba(243,213,138,.08); font-size: 10px; }
       .metrics { min-height: 16px; margin: 0 0 8px; color: #aab8d8; font-size: 11px; flex: 0 0 auto; }
+      .metrics .pipeline-metrics:not([hidden]) { display: block; margin-top: 2px; }
       .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; flex: 0 0 auto; }
       .actions .retry, .actions .continue, .actions .view-toggle { grid-column: 1 / -1; }
       .actions .next-chapter { grid-column: 1 / -1; }
@@ -1216,7 +1217,7 @@
           <div class="progress-table-wrap"><table class="progress-table"><thead><tr><th>页码</th><th>准备</th><th>识别</th><th>翻译</th><th>修复</th><th>合成</th><th>结果</th></tr></thead><tbody data-role="progress-rows"></tbody></table></div>
           <div class="progress-selection" data-role="progress-selection">选择一页查看具体步骤。</div>
         </div>
-        <div class="metrics" data-role="metrics"><span data-role="average-time">平均每张图：--</span></div>
+        <div class="metrics" data-role="metrics"><span data-role="average-time">平均每张图：--</span><span class="pipeline-metrics" data-role="pipeline-metrics" hidden></span></div>
         <div class="actions">
           <button class="primary" data-action="start" type="button">翻译本章</button>
           <button data-action="pause" type="button" disabled>暂停</button>
@@ -1243,6 +1244,7 @@
   const countNode = shadow.querySelector('.count');
   const statusNode = shadow.querySelector('.status');
   const averageTimeNode = shadow.querySelector('[data-role="average-time"]');
+  const pipelineMetricsNode = shadow.querySelector('[data-role="pipeline-metrics"]');
   const backendNode = shadow.querySelector('[data-role="backend"]');
   const chapterProgressNode = shadow.querySelector('[data-role="chapter-progress"]');
   const chapterLabelNode = shadow.querySelector('[data-role="chapter-label"]');
@@ -1266,7 +1268,20 @@
   const PIPELINE_STAGES = ['recognize', 'translate', 'inpaint', 'render'];
 
   function emptyStageProgress() {
-    return { state: 'waiting', step: '', startedAt: 0, elapsedMs: 0, updatedAt: 0, error: '' };
+    return {
+      state: 'waiting', step: '', startedAt: 0, elapsedMs: 0, updatedAt: 0, error: '',
+      traceBusyMs: 0, traceWaitMs: 0, traceQueuedServer: 0, traceQueuedClient: 0, traceRunServer: 0, traceRunClient: 0,
+    };
+  }
+
+  function closeStageTraceSegment(stage, clientNow, serverTs = 0) {
+    if (stage.traceRunServer && serverTs) {
+      stage.traceBusyMs += Math.max(0, serverTs - stage.traceRunServer);
+    } else if (stage.traceRunClient) {
+      stage.traceBusyMs += Math.max(0, clientNow - stage.traceRunClient);
+    }
+    stage.traceRunServer = 0;
+    stage.traceRunClient = 0;
   }
 
   function createProgressTask(taskId, chapterLabel, entries, backend = '', pageProgressVersion = 0) {
@@ -1277,6 +1292,8 @@
         pageIndex,
         filename: entry.name || entry.filename || `page-${pageIndex + 1}`,
         outcome: 'pending',
+        traceFirstAt: 0,
+        traceLastAt: 0,
         stages: Object.fromEntries(PROGRESS_STAGES.map(stage => [stage, emptyStageProgress()])),
       });
       entry.progressTaskId = taskId;
@@ -1405,6 +1422,31 @@
     const nextState = ['waiting', 'running', 'done', 'skipped', 'error'].includes(message.state)
       ? message.state
       : 'waiting';
+    const serverTs = Number(message.serverTs) > 0 ? Number(message.serverTs) : 0;
+    const wasRunning = stage.state === 'running';
+    if (!page.traceFirstAt) page.traceFirstAt = now;
+    page.traceLastAt = now;
+    if (nextState === 'waiting' && !stage.traceQueuedServer && !stage.traceQueuedClient) {
+      stage.traceQueuedServer = serverTs;
+      stage.traceQueuedClient = now;
+    } else if (nextState === 'running' && !wasRunning) {
+      if (stage.traceQueuedServer || stage.traceQueuedClient) {
+        if (stage.traceQueuedServer && serverTs) {
+          stage.traceWaitMs += Math.max(0, serverTs - stage.traceQueuedServer);
+        } else if (stage.traceQueuedClient) {
+          stage.traceWaitMs += Math.max(0, now - stage.traceQueuedClient);
+        }
+        stage.traceQueuedServer = 0;
+        stage.traceQueuedClient = 0;
+      }
+      stage.traceRunServer = serverTs;
+      stage.traceRunClient = now;
+    } else if (wasRunning && nextState !== 'running') {
+      closeStageTraceSegment(stage, now, serverTs);
+    } else if (wasRunning && nextState === 'running') {
+      if (!stage.traceRunServer) stage.traceRunServer = serverTs;
+      if (!stage.traceRunClient) stage.traceRunClient = now;
+    }
     if (stage.state === 'running' && nextState !== 'running' && stage.startedAt) {
       stage.elapsedMs += Math.max(0, now - stage.startedAt);
       stage.startedAt = 0;
@@ -1439,6 +1481,8 @@
     result.error = '';
     page.outcome = 'success';
     page.lastError = '';
+    page.traceLastAt = performance.now();
+    if (!page.traceFirstAt) page.traceFirstAt = page.traceLastAt;
     updateProgressView();
   }
 
@@ -1453,9 +1497,12 @@
       if (stage.state !== 'running') return;
       if (stage.startedAt) stage.elapsedMs += Math.max(0, performance.now() - stage.startedAt);
       stage.startedAt = 0;
+      closeStageTraceSegment(stage, performance.now());
       stage.state = 'error';
       stage.error = stage.error || page.lastError;
     });
+    page.traceLastAt = performance.now();
+    if (!page.traceFirstAt) page.traceFirstAt = page.traceLastAt;
     const hasStageError = PROGRESS_STAGES.some(stageName => page.stages[stageName].state === 'error');
     if (!hasStageError) {
       page.stages.result.state = 'error';
@@ -1586,6 +1633,7 @@
 
   function updateProgressView() {
     const task = getActiveProgressTask();
+    updatePipelineMetrics();
     if (!task) {
       chapterProgressNode.hidden = true;
       batchSummaryNode.hidden = true;
@@ -1904,6 +1952,54 @@
     return Math.max(0, now - state.processingStartedAt - state.processingPausedMs - pausedNow);
   }
 
+  function updatePipelineMetrics() {
+    if (!pipelineMetricsNode) return;
+    const task = getActiveProgressTask();
+    const batchPages = task
+      ? task.batchPageIndices.map(index => task.pages.get(index)).filter(Boolean)
+      : [];
+    let wallStart = 0;
+    let wallEnd = 0;
+    batchPages.forEach(page => {
+      if (!page.traceFirstAt || !page.traceLastAt) return;
+      wallStart = wallStart ? Math.min(wallStart, page.traceFirstAt) : page.traceFirstAt;
+      wallEnd = Math.max(wallEnd, page.traceLastAt);
+    });
+    const wall = wallEnd > wallStart ? wallEnd - wallStart : 0;
+    let busyTotal = 0;
+    const parts = [];
+    let translateWaitSum = 0;
+    let translateWaitCount = 0;
+    PIPELINE_STAGES.forEach(stageName => {
+      let busy = 0;
+      batchPages.forEach(page => {
+        const stage = page.stages[stageName];
+        if (!stage) return;
+        busy += Number(stage.traceBusyMs) || 0;
+        if (stageName === 'translate') {
+          const wait = Number(stage.traceWaitMs) || 0;
+          if (wait > 0) {
+            translateWaitSum += wait;
+            translateWaitCount += 1;
+          }
+        }
+      });
+      busyTotal += busy;
+      const percent = wall > 0 ? Math.round((busy / wall) * 100) : 0;
+      parts.push(`${PROGRESS_STAGE_LABELS[stageName]} ${percent}%`);
+    });
+    if (!wall || busyTotal <= 0) {
+      pipelineMetricsNode.hidden = true;
+      pipelineMetricsNode.textContent = '';
+      return;
+    }
+    let text = `流水线：${parts.join(' · ')} · 填充 ${(busyTotal / wall).toFixed(2)}/${PIPELINE_STAGES.length}`;
+    if (translateWaitCount > 0) text += ` · 翻译排队均 ${formatDuration(translateWaitSum / translateWaitCount)}`;
+    pipelineMetricsNode.hidden = false;
+    pipelineMetricsNode.textContent = text;
+    pipelineMetricsNode.title = '按当前批次统计：百分比 = 各阶段忙碌时间 / 批次耗时；填充 = 各阶段利用率之和（上限为阶段数量）；翻译排队均 = 等待进入翻译阶段的平均时长';
+  }
+
   function updateAverageTime() {
     const task = getActiveProgressTask();
     const completed = task
@@ -1911,9 +2007,11 @@
       : state.translated + state.failed;
     if (!state.processingStartedAt || completed <= 0) {
       averageTimeNode.textContent = '平均每张图：--';
+      updatePipelineMetrics();
       return;
     }
     averageTimeNode.textContent = `平均每张图：${formatDuration(processingElapsed() / completed)}（已处理 ${completed} 张）`;
+    updatePipelineMetrics();
   }
 
   function resetProcessingClock() {
