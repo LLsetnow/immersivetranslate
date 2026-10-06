@@ -756,10 +756,12 @@ def _service_base_url(service: dict) -> str:
     return 'https://' + authority
 
 
-def _remote_start_script(nonce: str) -> str:
+def _remote_start_script(nonce: str, probe_only: bool = False) -> str:
     nonce_base64 = base64.b64encode(nonce.encode('utf-8')).decode('ascii')
+    probe_only_value = '1' if probe_only else '0'
     return f'''set -eu
 NONCE="$(printf '%s' {shlex.quote(nonce_base64)} | base64 -d)"
+PROBE_ONLY={probe_only_value}
 STATE_DIR=/tmp/immersive-translate
 PID_FILE="$STATE_DIR/shared-api.pid"
 NONCE_FILE="$STATE_DIR/shared-api.nonce"
@@ -768,23 +770,122 @@ mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
 SERVER_RUNNING=0
+SERVER_PID=""
+METADATA_MATCH=0
 if [ -s "$PID_FILE" ]; then
-  SERVER_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-  SERVER_COMMAND="$(ps -p "$SERVER_PID" -o args= 2>/dev/null || true)"
-  case "$SERVER_COMMAND" in
-    *'-m manga_translator shared'*) SERVER_RUNNING=1 ;;
+  CANDIDATE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  CANDIDATE_COMMAND="$(ps -p "$CANDIDATE_PID" -o args= 2>/dev/null || true)"
+  case "$CANDIDATE_COMMAND" in
+    *'-m manga_translator shared'*)
+      SERVER_PID="$CANDIDATE_PID"
+      METADATA_MATCH=1
+      ;;
   esac
 fi
 
-if [ "$SERVER_RUNNING" = 1 ]; then
-  if [ ! -s "$NONCE_FILE" ] || [ ! -s "$PROJECT_ROOT_FILE" ]; then
-    echo 'AIGATE_ERROR=managed server metadata is incomplete' >&2
+LISTENER_ENTRY=""
+if command -v ss >/dev/null 2>&1; then
+  LISTENER_ENTRY="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:6006$/ {{print; exit}}' || true)"
+fi
+LISTENER_PID="$(printf '%s' "$LISTENER_ENTRY" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+if [ -z "$SERVER_PID" ] && [ -n "$LISTENER_PID" ]; then
+  CANDIDATE_COMMAND="$(ps -p "$LISTENER_PID" -o args= 2>/dev/null || true)"
+  case "$CANDIDATE_COMMAND" in
+    *'-m manga_translator shared'*)
+      SERVER_PID="$LISTENER_PID"
+      ;;
+  esac
+fi
+
+if [ -n "$SERVER_PID" ]; then
+  PROBE_PYTHON="$(readlink -f "/proc/$SERVER_PID/exe" 2>/dev/null || true)"
+  if [ ! -x "$PROBE_PYTHON" ]; then
+    PROBE_PYTHON="$(command -v python3 || true)"
+  fi
+  COMMAND_NONCE=""
+  if [ -n "$PROBE_PYTHON" ]; then
+    COMMAND_NONCE="$("$PROBE_PYTHON" - "$SERVER_PID" 2>/dev/null <<'PY' || true
+import sys
+try:
+    args = open('/proc/' + sys.argv[1] + '/cmdline', 'rb').read().split(b'\\0')
+    for index, argument in enumerate(args[:-1]):
+        if argument == b'--nonce':
+            print(args[index + 1].decode('utf-8'))
+            break
+except Exception:
+    pass
+PY
+)"
+  fi
+  RECOVERED_NONCE="$(cat "$NONCE_FILE" 2>/dev/null || true)"
+  if [ -n "$COMMAND_NONCE" ] && [ "${{#COMMAND_NONCE}}" -ge 24 ]; then
+    RECOVERED_NONCE="$COMMAND_NONCE"
+  fi
+  PROJECT_ROOT="$(readlink -f "/proc/$SERVER_PID/cwd" 2>/dev/null || true)"
+  if [ -z "$PROJECT_ROOT" ]; then
+    PROJECT_ROOT="$(cat "$PROJECT_ROOT_FILE" 2>/dev/null || true)"
+  fi
+  PROJECT_FILE="$PROJECT_ROOT/manga_translator/__main__.py"
+  if [ -z "$PROBE_PYTHON" ] || [ -z "$RECOVERED_NONCE" ] || [ "${{#RECOVERED_NONCE}}" -lt 24 ] \
+    || [ ! -f "$PROJECT_FILE" ]; then
+    PROCESS_NAME="$(ps -p "$SERVER_PID" -o comm= 2>/dev/null || true)"
+    echo "AIGATE_ERROR=existing port 6006 process could not be verified (PID $SERVER_PID, process ${{PROCESS_NAME:-unknown}})" >&2
     exit 21
   fi
-  NONCE="$(cat "$NONCE_FILE")"
-  PROJECT_ROOT="$(cat "$PROJECT_ROOT_FILE")"
-  PROJECT_FILE="$PROJECT_ROOT/manga_translator/__main__.py"
+  if [ "$METADATA_MATCH" != 1 ] || [ "$PROBE_ONLY" = 1 ]; then
+    if "$PROBE_PYTHON" - "$RECOVERED_NONCE" <<'PY' >/dev/null 2>&1
+import json
+import sys
+import time
+import urllib.request
+deadline = time.monotonic() + 20
+while True:
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:6006/backend_info', timeout=5) as response:
+            info = json.loads(response.read().decode('utf-8'))
+        if info.get('service') != 'manga-translator-ui' or info.get('mode') != 'shared':
+            sys.exit(1)
+        if info.get('protocol') != 'manga-translator-ui-shared-v2' or int(info.get('configApiVersion') or 0) < 1:
+            sys.exit(1)
+        request = urllib.request.Request('http://127.0.0.1:6006/config')
+        request.add_header('X-Nonce', sys.argv[1])
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.status != 200:
+                sys.exit(1)
+        break
+    except Exception:
+        if time.monotonic() >= deadline:
+            sys.exit(1)
+        time.sleep(2)
+PY
+    then
+      :
+    else
+      PROCESS_NAME="$(ps -p "$SERVER_PID" -o comm= 2>/dev/null || true)"
+      echo "AIGATE_ERROR=existing port 6006 process is not a verified shared translation service (PID $SERVER_PID, process ${{PROCESS_NAME:-unknown}})" >&2
+      exit 21
+    fi
+  fi
+  NONCE="$RECOVERED_NONCE"
+  printf '%s' "$NONCE" > "$NONCE_FILE"
+  chmod 600 "$NONCE_FILE"
+  printf '%s' "$PROJECT_ROOT" > "$PROJECT_ROOT_FILE"
+  chmod 600 "$PROJECT_ROOT_FILE"
+  printf '%s' "$SERVER_PID" > "$PID_FILE"
+  SERVER_RUNNING=1
 else
+  if [ -n "$LISTENER_ENTRY" ]; then
+    if [ "$PROBE_ONLY" = 1 ]; then
+      echo "AIGATE_ERROR=port 6006 is occupied by an unverified process (PID ${{LISTENER_PID:-unknown}})" >&2
+    else
+      echo "AIGATE_ERROR=port 6006 is already in use by another process (PID ${{LISTENER_PID:-unknown}})" >&2
+    fi
+    exit 24
+  fi
+  if [ "$PROBE_ONLY" = 1 ]; then
+    echo 'AIGATE_ERROR=no running manga-translator shared service was found; start the service first' >&2
+    exit 27
+  fi
   rm -f "$PID_FILE" "$NONCE_FILE" "$PROJECT_ROOT_FILE"
   PROJECT_FILE="$(find /home/waas -maxdepth 6 -type f -path '*/manga-translator-ui/manga_translator/__main__.py' -print -quit 2>/dev/null || true)"
   if [ -z "$PROJECT_FILE" ]; then
@@ -815,7 +916,7 @@ else
     exit 23
   fi
   if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ':6006 '; then
-    echo 'AIGATE_ERROR=port 6006 is already in use by another process' >&2
+    echo 'AIGATE_ERROR=port 6006 became occupied before the translation service could start' >&2
     exit 24
   fi
   if [ ! -d "$PROJECT_ROOT" ] || [ ! -f "$PROJECT_FILE" ]; then
@@ -844,7 +945,7 @@ printf 'IMT_NONCE_B64=%s\\n' "$(printf '%s' "$NONCE" | base64 | tr -d '\\n')"
 '''
 
 
-def _start_remote_shared_server(request: dict, on_progress=None) -> dict:
+def _start_remote_shared_server(request: dict, on_progress=None, probe_only: bool = False) -> dict:
     token = str(request.get('token') or '').strip()
     instance_id = str(request.get('instanceId') or '').strip()
     nonce = str(request.get('nonce') or secrets.token_urlsafe(32)).strip()
@@ -861,24 +962,28 @@ def _start_remote_shared_server(request: dict, on_progress=None) -> dict:
             if mapping_error:
                 raise RuntimeError(mapping_error)
         status = aigate.instance_status(detail)
-        if status in {'3', '7', '22'}:
-            if on_progress:
-                on_progress('正在启动云扉实例…')
-            aigate.control_instance(token, instance_id, 'open')
-
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            detail = aigate.get_instance_detail(token, instance_id)
-            status = aigate.instance_status(detail)
-            if status == '2':
-                break
-            if status == '4':
-                raise RuntimeError('所选云扉实例已释放')
-            if on_progress:
-                on_progress(f'等待云扉实例启动（状态 {status or "未知"}）…')
-            time.sleep(3)
+        if probe_only:
+            if status != '2':
+                raise RuntimeError(f'所选云扉实例当前未运行（状态 {status or "未知"}）；连通性检查不会启动实例')
         else:
-            raise RuntimeError('等待云扉实例启动超时')
+            if status in {'3', '7', '22'}:
+                if on_progress:
+                    on_progress('正在启动云扉实例…')
+                aigate.control_instance(token, instance_id, 'open')
+
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                detail = aigate.get_instance_detail(token, instance_id)
+                status = aigate.instance_status(detail)
+                if status == '2':
+                    break
+                if status == '4':
+                    raise RuntimeError('所选云扉实例已释放')
+                if on_progress:
+                    on_progress(f'等待云扉实例启动（状态 {status or "未知"}）…')
+                time.sleep(3)
+            else:
+                raise RuntimeError('等待云扉实例启动超时')
 
         mapping_error = _service_mapping_error(detail)
         if mapping_error:
@@ -905,11 +1010,14 @@ def _start_remote_shared_server(request: dict, on_progress=None) -> dict:
             'bash -s',
         ]
         if on_progress:
-            on_progress('正在通过 SSH 启动 /home/waas 中的 manga-translator-ui…')
+            on_progress(
+                '正在通过 SSH 检查所选实例上的翻译服务…'
+                if probe_only else '正在通过 SSH 启动 /home/waas 中的 manga-translator-ui…'
+            )
         env = os.environ.copy()
         remote = subprocess.run(
             [ssh_command, *ssh_args],
-            input=_remote_start_script(nonce),
+            input=_remote_start_script(nonce, probe_only=probe_only),
             capture_output=True,
             text=True,
             timeout=35,
@@ -950,7 +1058,7 @@ def _start_remote_shared_server(request: dict, on_progress=None) -> dict:
             ]
             remote = subprocess.run(
                 [sshpass, '-e', ssh_command, *password_args],
-                input=_remote_start_script(nonce),
+                input=_remote_start_script(nonce, probe_only=probe_only),
                 capture_output=True,
                 text=True,
                 timeout=90,
@@ -960,7 +1068,8 @@ def _start_remote_shared_server(request: dict, on_progress=None) -> dict:
         if remote.returncode != 0:
             detail_text = (remote.stderr or remote.stdout or '').strip().splitlines()
             safe_detail = detail_text[-1][:240] if detail_text else f'SSH 退出码 {remote.returncode}'
-            raise RuntimeError(f'启动云端翻译服务失败：{safe_detail}')
+            prefix = '检查云端翻译服务失败' if probe_only else '启动云端翻译服务失败'
+            raise RuntimeError(f'{prefix}：{safe_detail}')
 
         remote_values = {}
         for line in remote.stdout.splitlines():
@@ -970,7 +1079,7 @@ def _start_remote_shared_server(request: dict, on_progress=None) -> dict:
                 remote_values['nonce'] = base64.b64decode(line.split('=', 1)[1]).decode('utf-8')
         nonce = remote_values.get('nonce') or nonce
         if on_progress:
-            on_progress('正在检查 AIGate 翻译服务…')
+            on_progress('正在验证 AIGate HTTP 6006 服务和访问凭据…')
 
         deadline = time.monotonic() + 90
         info = None
@@ -991,6 +1100,11 @@ def _start_remote_shared_server(request: dict, on_progress=None) -> dict:
                     except (TypeError, ValueError):
                         config_api_version = 0
                     if config_api_version >= 1:
+                        config_request = Request(base_url + '/config', headers={'X-Nonce': nonce})
+                        with urlopen(config_request, timeout=8) as response:
+                            if response.status != 200:
+                                raise RuntimeError(f'配置 API 凭据验证失败：HTTP {response.status}')
+                            response.read(1)
                         return {
                             'success': True,
                             'instanceId': instance_id,
@@ -1001,7 +1115,9 @@ def _start_remote_shared_server(request: dict, on_progress=None) -> dict:
                     raise RuntimeError('AIGate 服务已连通，但缺少统一配置 API v1；请更新项目并重启服务进程')
                 else:
                     last_error = '服务协议不匹配'
-            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+            except HTTPError as error:
+                last_error = f'HTTP {error.code}'
+            except (URLError, TimeoutError, OSError, ValueError) as error:
                 last_error = type(error).__name__
             if on_progress and time.monotonic() - last_progress >= 10:
                 on_progress('AIGate 翻译服务仍在初始化，继续等待…')
@@ -1032,6 +1148,8 @@ def handle_request(request: dict, on_progress=None) -> dict:
         return _aigate_create_instance(request)
     if action == 'aigateStartTranslation':
         return _start_remote_shared_server(request, on_progress=on_progress)
+    if action == 'aigateCheckTranslation':
+        return _start_remote_shared_server(request, on_progress=on_progress, probe_only=True)
     if action == 'aigateStopInstance':
         token = str(request.get('token') or '').strip()
         instance_id = str(request.get('instanceId') or '').strip()

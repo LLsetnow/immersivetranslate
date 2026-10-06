@@ -1,6 +1,4 @@
 // 侧边栏翻译器 - 用于全文翻译和滚动自动翻译功能
-// 作者：AI快码加编 公众号
-
 // 使用WeakSet追踪已翻译元素，防止重复翻译
 const translatedElements = new WeakSet();
 // 使用Set跟踪已请求翻译的文本，防止重复请求

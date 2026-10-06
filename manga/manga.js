@@ -639,7 +639,18 @@
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return validateAigateBackendInfo(await response.json());
+      const info = validateAigateBackendInfo(await response.json());
+      const configResponse = await fetch(`${serviceEndpoint}/config`, {
+        headers: { 'X-Nonce': serviceNonce },
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      if (!configResponse.ok) {
+        if (configResponse.status === 401) throw new Error('云端服务访问凭据无效，请重新启动或检查服务');
+        throw new Error(`配置 API HTTP ${configResponse.status}`);
+      }
+      if (configResponse.body) await configResponse.body.cancel();
+      return info;
     } catch (error) {
       if (error.name === 'AbortError') throw new Error('检查 AIGate HTTP 6006 连通性超时');
       throw error;
@@ -770,10 +781,11 @@
       || !state.aigateImageId;
     startAigateButton.disabled = lifecycleBusy || !state.aigateInstanceId;
     checkAigateServiceButton.disabled = lifecycleBusy
-      || !state.aigateEndpoint
-      || state.aigateNonce.length < 24;
+      || !state.aigateToken
+      || !state.aigateInstanceId;
     stopAigateButton.disabled = lifecycleBusy || !state.aigateInstanceId;
     startAigateButton.title = '在所选实例中启动或复用翻译服务进程，并等待 HTTP 6006 连通性检查通过';
+    checkAigateServiceButton.title = '只检查已运行的实例和翻译服务，不启动实例或服务进程';
   }
 
   function renderBackendMode() {
@@ -906,7 +918,9 @@
       setAigateStatus(
         serviceStarted
           ? `云端进程已启动，但页面连通性确认或状态保存失败：${error.message || error}。可点击“检查连通性”重试`
-          : `启动云端翻译服务失败：${error.message || error}`,
+          : String(error.message || error).startsWith('启动云端翻译服务失败：')
+            ? String(error.message || error)
+            : `启动云端翻译服务失败：${error.message || error}`,
         'error',
       );
       return false;
@@ -918,16 +932,33 @@
   }
 
   async function checkAigateServiceConnectivity({ automatic = false } = {}) {
-    const endpoint = state.aigateEndpoint;
-    const nonce = state.aigateNonce;
-    if (!endpoint || String(nonce || '').trim().length < 24) {
-      if (!automatic) setAigateStatus('请先选择已有实例并启动云端服务进程', 'error');
+    let endpoint = state.aigateEndpoint;
+    let nonce = state.aigateNonce;
+    if (!state.aigateToken || !state.aigateInstanceId) {
+      if (!automatic) setAigateStatus('请填写 AIGate Token 并选择一个已有实例', 'error');
       return false;
     }
     state.checkingAigateConnectivity = true;
     renderAigateResources();
-    setAigateStatus('正在检查所选实例的 HTTP 6006 连通性…');
+    setAigateStatus('正在检查所选实例上的翻译进程和 HTTP 6006 连通性…');
     try {
+      if (!endpoint || String(nonce || '').trim().length < 24) {
+        const result = await nativeRequestWithProgress({
+          action: 'aigateCheckTranslation',
+          token: state.aigateToken,
+          instanceId: state.aigateInstanceId,
+        }, message => setAigateStatus(message));
+        if (!result.success) throw new Error(result.error || '检查云端翻译服务失败');
+        endpoint = normalizeAigateEndpoint(result.endpoint);
+        nonce = String(result.nonce || '').trim();
+        if (nonce.length < 24) throw new Error('云端服务未返回有效访问凭据');
+        state.aigateEndpoint = endpoint;
+        state.aigateNonce = nonce;
+        await storageSet({
+          mangaAigateEndpoint: endpoint,
+          mangaAigateNonce: nonce,
+        });
+      }
       const info = await fetchAigateBackendInfo(endpoint, nonce);
       setAigateStatus(`云端服务连通正常 · 配置 API v${info.configApiVersion}`, 'success');
       return true;

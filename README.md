@@ -1,14 +1,11 @@
 # 网页实时翻译扩展
 
-每周一个AI开源软件系列，一个强大的浏览器扩展，可以实时翻译网页内容，支持多种翻译模式和多个翻译引擎。
+一个支持网页和漫画翻译的浏览器扩展，提供多种翻译模式和翻译引擎。
 
 ## 软件界面
 
-### 设置界面
-![翻译扩展设置界面](https://raw.githubusercontent.com/TimeCyber/immersivetranslate/master/images/translator-popup.png)
-
 ### 网页翻译效果
-![网页翻译效果](https://raw.githubusercontent.com/TimeCyber/immersivetranslate/master/images/translator-forum.png)
+![网页翻译效果](images/translator-forum.png)
 
 ## 功能特点
 

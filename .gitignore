@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Built by native-host/install-macos.sh for the current Mac.
+native-host/manga_backend_host
+
+# Runtime state and local caches.
+manga_translator/server/data/logs.json
