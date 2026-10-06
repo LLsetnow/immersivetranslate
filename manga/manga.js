@@ -797,8 +797,8 @@
       || !state.aigateToken
       || !state.aigateInstanceId;
     stopAigateButton.disabled = lifecycleBusy || !state.aigateInstanceId;
-    startAigateButton.title = '在所选实例中启动或复用翻译服务进程，并等待 HTTP 6006 连通性检查通过';
-    checkAigateServiceButton.title = '只检查已运行的实例和翻译服务，不启动实例或服务进程';
+    startAigateButton.title = '先从个人 GitHub manga-translator-ui 跟踪分支执行 git pull，再启动或更新 GPU 翻译服务';
+    checkAigateServiceButton.title = '只检查已运行实例的仓库版本、GPU 环境和 HTTP 6006 连通性，不启动实例或拉取代码';
   }
 
   function renderBackendMode() {
@@ -811,7 +811,7 @@
     const note = $('#app-config-note');
     if (note) {
       note.textContent = state.backendMode === 'aigate'
-        ? '原图将上传到 AIGate；翻译结果回传后由本机共享服务写入所选目录和缓存清单。本地桥仅提供配置与缓存读写，不会执行本地翻译。云端项目和环境会在实例的 /home/waas 中自动定位。'
+        ? '原图将上传到 AIGate；翻译结果回传后由本机共享服务写入所选目录和缓存清单。本地桥仅提供配置与缓存读写，不会执行本地翻译。启动云端服务前会从你的 manga-translator-ui GitHub 跟踪分支快进同步代码。'
         : '本地模式读取本机 manga-translator-ui/config/config.json；此模式不需要 Web 登录，翻译结果保存在所选输出目录。';
     }
   }
@@ -907,6 +907,10 @@
       }, message => setAigateStatus(message));
       if (!result.success) throw new Error(result.error || '启动 AIGate 翻译服务失败');
       const gpu = validateAigateGpu(result.gpu);
+      const revision = String(result.revision || '').trim();
+      if (!/^[a-f0-9]{7,40}$/i.test(revision)) {
+        throw new Error('云端服务未确认 git pull 后的漫画翻译仓库版本');
+      }
       serviceStarted = true;
       state.aigateInstanceId = selectedInstanceId;
       state.aigateEndpoint = normalizeAigateEndpoint(result.endpoint);
@@ -933,7 +937,8 @@
       }
       resetBackendLogCursor();
       const backendInfo = await fetchAigateBackendInfo(state.aigateEndpoint, state.aigateNonce);
-      setAigateStatus(`${aigateGpuSummary(gpu)} 已就绪，PyTorch/ONNX GPU 配置已应用；HTTP 6006 与配置 API v${backendInfo.configApiVersion} 正常`, 'success');
+      const syncStatus = result.sourceUpdated ? '已拉取新提交' : '仓库已是最新';
+      setAigateStatus(`${aigateGpuSummary(gpu)} 已就绪 · manga-translator-ui ${revision}（${syncStatus}），PyTorch/ONNX GPU 配置已应用；HTTP 6006 与配置 API v${backendInfo.configApiVersion} 正常`, 'success');
       return true;
     } catch (error) {
       setAigateStatus(
@@ -987,7 +992,8 @@
       if (!configResult.success || configResult.backend !== 'aigate') {
         throw new Error(configResult.error || '云端 GPU 配置未确认应用');
       }
-      setAigateStatus(`${aigateGpuSummary(gpu)} 已就绪，GPU 配置已应用 · HTTP 6006 与配置 API v${info.configApiVersion} 正常`, 'success');
+      const revision = String(result.revision || '').trim();
+      setAigateStatus(`${aigateGpuSummary(gpu)} 已就绪 · 云端代码 ${revision || '版本未知'}，GPU 配置已应用 · HTTP 6006 与配置 API v${info.configApiVersion} 正常`, 'success');
       return true;
     } catch (error) {
       setAigateStatus(`云端服务连通性检查失败：${error.message || error}`, 'error');

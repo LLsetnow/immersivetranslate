@@ -811,17 +811,66 @@ print('OK:' + encoded)
 PY
 }}
 
+sync_project() {{
+  local root="$1"
+  local tracking_ref remote_name branch_name remote_url before after
+  if ! git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo 'AIGATE_ERROR=manga-translator-ui source is not a Git worktree; refusing to start stale code' >&2
+    return 1
+  fi
+  tracking_ref="$(git -C "$root" rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
+  if [ -z "$tracking_ref" ]; then
+    echo 'AIGATE_ERROR=manga-translator-ui branch has no configured upstream; set it to your personal GitHub branch before starting' >&2
+    return 1
+  fi
+  remote_name="${{tracking_ref%%/*}}"
+  branch_name="${{tracking_ref#*/}}"
+  remote_url="$(git -C "$root" remote get-url "$remote_name" 2>/dev/null || true)"
+  case "$remote_url" in
+    https://github.com/LLsetnow/manga-translator-ui|https://github.com/LLsetnow/manga-translator-ui.git|git@github.com:LLsetnow/manga-translator-ui.git|ssh://git@github.com/LLsetnow/manga-translator-ui.git)
+      ;;
+    *)
+      echo 'AIGATE_ERROR=manga-translator-ui upstream is not LLsetnow/manga-translator-ui; refusing to pull from another repository' >&2
+      return 1
+      ;;
+  esac
+  if [ -n "$(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null || true)" ]; then
+    echo 'AIGATE_ERROR=manga-translator-ui has tracked local changes; refusing to overwrite them before git pull' >&2
+    return 1
+  fi
+  before="$(git -C "$root" rev-parse --verify HEAD 2>/dev/null || true)"
+  if [ -z "$before" ]; then
+    echo 'AIGATE_ERROR=manga-translator-ui has no current Git commit' >&2
+    return 1
+  fi
+  if ! git -C "$root" pull --ff-only --quiet "$remote_name" "$branch_name" >/dev/null 2>&1; then
+    echo 'AIGATE_ERROR=git pull --ff-only failed for the configured personal manga-translator-ui branch; check network, branch, and divergence' >&2
+    return 1
+  fi
+  after="$(git -C "$root" rev-parse --verify HEAD 2>/dev/null || true)"
+  if [ -z "$after" ]; then
+    echo 'AIGATE_ERROR=unable to read manga-translator-ui commit after git pull' >&2
+    return 1
+  fi
+  if [ "$before" != "$after" ]; then
+    SOURCE_UPDATED=1
+  fi
+  PROJECT_REVISION="${{after:0:12}}"
+}}
+
 SERVER_RUNNING=0
 SERVER_PID=""
-METADATA_MATCH=0
 GPU_INFO_B64=""
+GPU_READY=0
+PULL_DONE=0
+SOURCE_UPDATED=0
+PROJECT_REVISION=""
 if [ -s "$PID_FILE" ]; then
   CANDIDATE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
   CANDIDATE_COMMAND="$(ps -p "$CANDIDATE_PID" -o args= 2>/dev/null || true)"
   case "$CANDIDATE_COMMAND" in
     *'-m manga_translator shared'*)
       SERVER_PID="$CANDIDATE_PID"
-      METADATA_MATCH=1
       ;;
   esac
 fi
@@ -875,8 +924,7 @@ PY
     echo "AIGATE_ERROR=existing port 6006 process could not be verified (PID $SERVER_PID, process ${{PROCESS_NAME:-unknown}})" >&2
     exit 21
   fi
-  if [ "$METADATA_MATCH" != 1 ] || [ "$PROBE_ONLY" = 1 ]; then
-    if "$PROBE_PYTHON" - "$RECOVERED_NONCE" <<'PY' >/dev/null 2>&1
+  if "$PROBE_PYTHON" - "$RECOVERED_NONCE" <<'PY' >/dev/null 2>&1
 import json
 import sys
 import time
@@ -901,26 +949,37 @@ while True:
             sys.exit(1)
         time.sleep(2)
 PY
-    then
-      :
-    else
-      PROCESS_NAME="$(ps -p "$SERVER_PID" -o comm= 2>/dev/null || true)"
-      echo "AIGATE_ERROR=existing port 6006 process is not a verified shared translation service (PID $SERVER_PID, process ${{PROCESS_NAME:-unknown}})" >&2
-      exit 21
-    fi
+  then
+    :
+  else
+    PROCESS_NAME="$(ps -p "$SERVER_PID" -o comm= 2>/dev/null || true)"
+    echo "AIGATE_ERROR=existing port 6006 process is not a verified shared translation service (PID $SERVER_PID, process ${{PROCESS_NAME:-unknown}})" >&2
+    exit 21
   fi
   GPU_CHECK_RESULT="$(gpu_probe "$PROBE_PYTHON" || true)"
   case "$GPU_CHECK_RESULT" in
     OK:*)
       GPU_INFO_B64="${{GPU_CHECK_RESULT#OK:}}"
+      GPU_READY=1
       ;;
     *)
       GPU_ERROR="${{GPU_CHECK_RESULT#ERROR:}}"
-      if [ "$PROBE_ONLY" = 1 ]; then
-        echo "AIGATE_ERROR=existing translation service is not GPU-ready: ${{GPU_ERROR:-CUDA validation failed}}; click start to restart the idle service with a CUDA-enabled environment" >&2
-        exit 28
-      fi
-      if "$PROBE_PYTHON" - "$RECOVERED_NONCE" "$SERVER_PID" <<'PY' >/dev/null 2>&1
+      ;;
+  esac
+  if [ "$PROBE_ONLY" = 1 ]; then
+    if [ "$GPU_READY" != 1 ]; then
+      echo "AIGATE_ERROR=existing translation service is not GPU-ready: ${{GPU_ERROR:-CUDA validation failed}}; click start to sync the repository and restart the idle service" >&2
+      exit 28
+    fi
+    NONCE="$RECOVERED_NONCE"
+    printf '%s' "$NONCE" > "$NONCE_FILE"
+    chmod 600 "$NONCE_FILE"
+    printf '%s' "$PROJECT_ROOT" > "$PROJECT_ROOT_FILE"
+    chmod 600 "$PROJECT_ROOT_FILE"
+    printf '%s' "$SERVER_PID" > "$PID_FILE"
+    SERVER_RUNNING=1
+  else
+    if ! "$PROBE_PYTHON" - "$RECOVERED_NONCE" "$SERVER_PID" <<'PY' >/dev/null 2>&1
 import json
 import sys
 import urllib.request
@@ -943,12 +1002,15 @@ with urllib.request.urlopen(base + '/is_locked', timeout=5) as response:
 if state.get('locked') or state.get('activeJob') or int(state.get('queued') or 0) > 0:
     sys.exit(2)
 PY
-      then
-        :
-      else
-        echo "AIGATE_ERROR=existing service is not GPU-ready (${{GPU_ERROR:-CUDA validation failed}}) and is busy or could not be safely verified; wait for its jobs to finish, then click start again" >&2
-        exit 29
-      fi
+    then
+      echo 'AIGATE_ERROR=existing translation service has an active job or could not be safely verified; wait for jobs to finish before synchronizing the repository' >&2
+      exit 29
+    fi
+    if ! sync_project "$PROJECT_ROOT"; then
+      exit 31
+    fi
+    PULL_DONE=1
+    if [ "$GPU_READY" != 1 ] || [ "$SOURCE_UPDATED" = 1 ]; then
       kill -TERM "$SERVER_PID" 2>/dev/null || true
       for ATTEMPT in $(seq 1 30); do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -957,15 +1019,17 @@ PY
         sleep 1
       done
       if kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo 'AIGATE_ERROR=GPU service restart timed out; the existing process was not force-killed' >&2
+        echo 'AIGATE_ERROR=translation service restart timed out; the existing process was not force-killed' >&2
         exit 30
       fi
       SERVER_PID=""
       SERVER_RUNNING=0
-      rm -f "$PID_FILE" "$NONCE_FILE" "$PROJECT_ROOT_FILE"
-      ;;
-  esac
-  if [ -n "$SERVER_PID" ]; then
+      rm -f "$PID_FILE" "$NONCE_FILE"
+    else
+      :
+    fi
+  fi
+  if [ "$PROBE_ONLY" != 1 ] && [ -n "$SERVER_PID" ]; then
     NONCE="$RECOVERED_NONCE"
     printf '%s' "$NONCE" > "$NONCE_FILE"
     chmod 600 "$NONCE_FILE"
@@ -994,9 +1058,13 @@ if [ "$SERVER_RUNNING" != 1 ]; then
     echo 'AIGATE_ERROR=no running manga-translator shared service was found; start the service first' >&2
     exit 27
   fi
-  rm -f "$PID_FILE" "$NONCE_FILE" "$PROJECT_ROOT_FILE"
-  PROJECT_FILE="$(find /home/waas -maxdepth 6 -type f -path '*/manga-translator-ui/manga_translator/__main__.py' -print -quit 2>/dev/null || true)"
-  if [ -z "$PROJECT_FILE" ]; then
+  rm -f "$PID_FILE" "$NONCE_FILE"
+  PROJECT_ROOT="$(cat "$PROJECT_ROOT_FILE" 2>/dev/null || true)"
+  PROJECT_FILE="$PROJECT_ROOT/manga_translator/__main__.py"
+  if [ ! -f "$PROJECT_FILE" ]; then
+    PROJECT_FILE="$(find /home/waas -maxdepth 6 -type f -path '*/manga-translator-ui/manga_translator/__main__.py' -print -quit 2>/dev/null || true)"
+  fi
+  if [ -z "$PROJECT_FILE" ] || [ ! -f "$PROJECT_FILE" ]; then
     PROJECT_FILE="$(find /home/waas -maxdepth 6 -type f -path '*/manga_translator/__main__.py' ! -path '*/.venv/*' -print -quit 2>/dev/null || true)"
   fi
   if [ -z "$PROJECT_FILE" ]; then
@@ -1004,6 +1072,11 @@ if [ "$SERVER_RUNNING" != 1 ]; then
     exit 22
   fi
   PROJECT_ROOT="${{PROJECT_FILE%/manga_translator/__main__.py}}"
+  if [ "$PULL_DONE" != 1 ]; then
+    if ! sync_project "$PROJECT_ROOT"; then
+      exit 31
+    fi
+  fi
   PYTHON_BIN=""
   LAST_GPU_ERROR=""
   for CANDIDATE_PYTHON in \
@@ -1058,9 +1131,14 @@ if [ "$SERVER_RUNNING" != 1 ]; then
 fi
 
 PROJECT_ROOT="$(cat "$PROJECT_ROOT_FILE" 2>/dev/null || printf '%s' "${{PROJECT_FILE%/manga_translator/__main__.py}}")"
+if [ -z "$PROJECT_REVISION" ] && git -C "$PROJECT_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
+  PROJECT_REVISION="$(git -C "$PROJECT_ROOT" rev-parse --short=12 HEAD 2>/dev/null || true)"
+fi
 printf 'IMT_PROJECT_B64=%s\\n' "$(printf '%s' "$PROJECT_ROOT" | base64 | tr -d '\\n')"
 printf 'IMT_NONCE_B64=%s\\n' "$(printf '%s' "$NONCE" | base64 | tr -d '\\n')"
 printf 'IMT_GPU_B64=%s\\n' "$GPU_INFO_B64"
+printf 'IMT_REVISION=%s\\n' "$PROJECT_REVISION"
+printf 'IMT_SOURCE_UPDATED=%s\\n' "$SOURCE_UPDATED"
 '''
 
 
@@ -1131,7 +1209,7 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
         if on_progress:
             on_progress(
                 '正在通过 SSH 检查所选实例上的翻译服务…'
-                if probe_only else '正在通过 SSH 启动 /home/waas 中的 manga-translator-ui…'
+                if probe_only else '正在同步你的 manga-translator-ui GitHub 分支，然后启动云端服务…'
             )
         env = os.environ.copy()
         remote = subprocess.run(
@@ -1139,7 +1217,7 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
             input=_remote_start_script(nonce, probe_only=probe_only),
             capture_output=True,
             text=True,
-            timeout=35,
+            timeout=240,
             env=env,
             check=False,
         )
@@ -1180,7 +1258,7 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
                 input=_remote_start_script(nonce, probe_only=probe_only),
                 capture_output=True,
                 text=True,
-                timeout=90,
+                timeout=240,
                 env=env,
                 check=False,
             )
@@ -1198,6 +1276,10 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
                 remote_values['nonce'] = base64.b64decode(line.split('=', 1)[1]).decode('utf-8')
             elif line.startswith('IMT_GPU_B64='):
                 remote_values['gpu'] = json.loads(base64.b64decode(line.split('=', 1)[1]).decode('utf-8'))
+            elif line.startswith('IMT_REVISION='):
+                remote_values['revision'] = line.split('=', 1)[1].strip()
+            elif line.startswith('IMT_SOURCE_UPDATED='):
+                remote_values['sourceUpdated'] = line.split('=', 1)[1].strip() == '1'
         nonce = remote_values.get('nonce') or nonce
         gpu = remote_values.get('gpu')
         if not isinstance(gpu, dict) or not gpu.get('cudaAvailable') or not gpu.get('onnxCudaAvailable'):
@@ -1236,6 +1318,8 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
                             'nonce': nonce,
                             'projectRoot': remote_values.get('projectRoot') or info.get('projectRoot', ''),
                             'gpu': gpu,
+                            'revision': remote_values.get('revision', ''),
+                            'sourceUpdated': bool(remote_values.get('sourceUpdated')),
                         }
                     raise RuntimeError('AIGate 服务已连通，但缺少统一配置 API v1；请更新项目并重启服务进程')
                 else:
