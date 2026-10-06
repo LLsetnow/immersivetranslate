@@ -6,7 +6,7 @@ function log(message, data) {
 // 默认设置
 const DEFAULT_SETTINGS = {
   translationMode: 'light',
-  translationEngine: 'ollama', // 默认使用Ollama
+  translationEngine: 'aliyun', // 默认使用阿里云通用翻译
   ollamaEndpoint: 'http://localhost:11434',
   ollamaModel: ''
 };
@@ -22,6 +22,8 @@ function initUI() {
     'translationEngine',
     'ollamaEndpoint',
     'ollamaModel',
+    'aliyunAccessKeyId',
+    'aliyunAccessKeySecret',
     'availableModels'
   ], function(result) {
     // 设置翻译模式
@@ -44,6 +46,9 @@ function initUI() {
     } else {
       document.getElementById('ollama-endpoint').value = DEFAULT_SETTINGS.ollamaEndpoint;
     }
+
+    document.getElementById('aliyun-access-key-id').value = result.aliyunAccessKeyId || '';
+    document.getElementById('aliyun-access-key-secret').value = result.aliyunAccessKeySecret || '';
     
     // 尝试加载之前保存的模型列表
     if (result.availableModels && Array.isArray(result.availableModels) && result.availableModels.length > 0) {
@@ -60,20 +65,28 @@ function initUI() {
     }
     
     // 根据选择的翻译引擎显示/隐藏Ollama设置
-    toggleOllamaSettings(result.translationEngine || DEFAULT_SETTINGS.translationEngine);
+    toggleEngineSettings(result.translationEngine || DEFAULT_SETTINGS.translationEngine);
   });
   
   // 添加翻译引擎切换事件
   document.getElementById('translation-engine').addEventListener('change', function(e) {
-    toggleOllamaSettings(e.target.value);
+    toggleEngineSettings(e.target.value);
   });
   
   // 添加测试Ollama连接按钮事件
   document.getElementById('test-ollama').addEventListener('click', testOllamaConnection);
+  document.getElementById('test-aliyun').addEventListener('click', testAliyunConnection);
   
   // 添加刷新模型列表按钮事件
   document.getElementById('refresh-models').addEventListener('click', function() {
     refreshModelsList();
+  });
+
+  document.getElementById('open-manga-translator').addEventListener('click', function() {
+    chrome.tabs.create({ url: chrome.runtime.getURL('manga/manga.html') });
+  });
+  document.getElementById('open-manga-config').addEventListener('click', function() {
+    chrome.tabs.create({ url: chrome.runtime.getURL('manga/config.html') });
   });
 }
 
@@ -81,6 +94,43 @@ function initUI() {
 function toggleOllamaSettings(engine) {
   const ollamaSettings = document.getElementById('ollama-settings');
   ollamaSettings.style.display = engine === 'ollama' ? 'block' : 'none';
+}
+
+function toggleEngineSettings(engine) {
+  toggleOllamaSettings(engine);
+  document.getElementById('aliyun-settings').style.display = engine === 'aliyun' ? 'block' : 'none';
+}
+
+function testAliyunConnection() {
+  const button = document.getElementById('test-aliyun');
+  const originalText = button.textContent;
+  const accessKeyId = document.getElementById('aliyun-access-key-id').value.trim();
+  const accessKeySecret = document.getElementById('aliyun-access-key-secret').value.trim();
+
+  if (!accessKeyId || !accessKeySecret) {
+    showMessage('请先填写 AccessKey ID 和 AccessKey Secret，再保存设置', true);
+    return;
+  }
+
+  updateButtonUI(button, 'loading', '', '测试中...');
+  chrome.runtime.sendMessage({
+    action: 'testAliyun',
+    credentials: { accessKeyId, accessKeySecret }
+  }, response => {
+    if (chrome.runtime.lastError) {
+      updateButtonUI(button, 'normal', originalText);
+      showMessage('阿里云连接测试失败: ' + chrome.runtime.lastError.message, true);
+      return;
+    }
+    if (!response || !response.success) {
+      updateButtonUI(button, 'normal', originalText);
+      showMessage(response?.error || '阿里云连接测试失败；请先保存设置', true);
+      return;
+    }
+    updateButtonUI(button, 'success', '', '✓ 测试成功');
+    showMessage(`阿里云连接成功，示例译文：${response.translation}`);
+    setTimeout(() => updateButtonUI(button, 'normal', originalText), 2000);
+  });
 }
 
 // 获取Ollama模型列表
@@ -367,7 +417,7 @@ function updateButtonUI(button, state, originalIcon = '', loadingText = '处理�
       showMessage('设置已恢复默认');
       break;
     case 'normal':
-      buttonText.textContent = originalText;
+      buttonText.textContent = originalIcon || buttonText.textContent;
       button.disabled = false;
       break;
   }
@@ -384,6 +434,8 @@ function saveSettings(event) {
   const translationEngine = document.getElementById('translation-engine').value;
   const ollamaEndpoint = document.getElementById('ollama-endpoint').value.trim();
   const ollamaModel = document.getElementById('ollama-model').value;
+  const aliyunAccessKeyId = document.getElementById('aliyun-access-key-id').value.trim();
+  const aliyunAccessKeySecret = document.getElementById('aliyun-access-key-secret').value.trim();
   
   // 验证输入
   if (translationEngine === 'ollama') {
@@ -397,6 +449,11 @@ function saveSettings(event) {
       return;
     }
   }
+
+  if (translationEngine === 'aliyun' && (!aliyunAccessKeyId || !aliyunAccessKeySecret)) {
+    showMessage('使用阿里云翻译前，请填写 AccessKey ID 和 AccessKey Secret', true);
+    return;
+  }
   
   // 更新按钮UI
   updateButtonUI(saveButton, 'loading', '', '保存中...');
@@ -407,6 +464,8 @@ function saveSettings(event) {
     translationEngine,
     ollamaEndpoint,
     ollamaModel,
+    aliyunAccessKeyId,
+    aliyunAccessKeySecret,
     availableModels
   };
   
@@ -420,7 +479,10 @@ function saveSettings(event) {
     }
     
     // 通知后台脚本设置已更新
-    chrome.runtime.sendMessage({ action: 'settingsUpdated', settings }, function(response) {
+    chrome.runtime.sendMessage({
+      action: 'settingsUpdated',
+      settings: { translationMode, translationEngine }
+    }, function(response) {
       log('设置更新通知发送成功，响应:', response);
     });
     
@@ -469,12 +531,15 @@ function resetSettings(event) {
         document.getElementById('translation-mode').value = DEFAULT_SETTINGS.translationMode;
         document.getElementById('translation-engine').value = DEFAULT_SETTINGS.translationEngine;
         document.getElementById('ollama-endpoint').value = DEFAULT_SETTINGS.ollamaEndpoint;
+        chrome.storage.local.remove(['aliyunAccessKeyId', 'aliyunAccessKeySecret']);
+        document.getElementById('aliyun-access-key-id').value = '';
+        document.getElementById('aliyun-access-key-secret').value = '';
         
         // 更新模型选择器
         populateModelSelector(availableModels, DEFAULT_SETTINGS.ollamaModel);
         
         // 显示/隐藏相关设置
-        toggleOllamaSettings(DEFAULT_SETTINGS.translationEngine);
+        toggleEngineSettings(DEFAULT_SETTINGS.translationEngine);
         
         updateButtonUI(resetButton, 'reset-success');
         
@@ -492,8 +557,12 @@ function resetSettings(event) {
         document.getElementById('translation-mode').value = DEFAULT_SETTINGS.translationMode;
         document.getElementById('translation-engine').value = DEFAULT_SETTINGS.translationEngine;
         document.getElementById('ollama-endpoint').value = DEFAULT_SETTINGS.ollamaEndpoint;
+        chrome.storage.local.remove(['aliyunAccessKeyId', 'aliyunAccessKeySecret']);
+        document.getElementById('aliyun-access-key-id').value = '';
+        document.getElementById('aliyun-access-key-secret').value = '';
+        populateModelSelector(availableModels, DEFAULT_SETTINGS.ollamaModel);
         
-        toggleOllamaSettings(DEFAULT_SETTINGS.translationEngine);
+        toggleEngineSettings(DEFAULT_SETTINGS.translationEngine);
         
         updateButtonUI(resetButton, 'reset-success');
         
@@ -526,4 +595,4 @@ document.addEventListener('DOMContentLoaded', function() {
   addAnimationStyles();
   initUI();
   prepareButtonsUI();
-}); 
+});

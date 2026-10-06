@@ -1,106 +1,6 @@
 // 翻译助手 - 后台脚本
 // 处理翻译请求和其他后台操作
 
-// 继续使用importScripts
-try {
-  importScripts('../scripts/crypto-js.min.js');
-  console.log('成功导入CryptoJS库');
-} catch (e) {
-  console.error('导入CryptoJS库失败:', e);
-}
-
-// 内联CryptoUtil实现
-const CryptoUtil = (() => {
-  // 加密密钥 - 与加密时使用的相同
-  const ENCRYPTION_KEY = 'BaiduTranslatorSecretKey7X91A'; // 确保这个密钥与加密时使用的相同
-  
-  // XOR加密/解密函数 (同一个函数可用于加密和解密)
-  function xorEncryptDecrypt(text, key) {
-    let result = '';
-    for (let i = 0; i < text.length; i++) {
-      result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-    }
-    return result;
-  }
-  
-  // 将字符串转换为Base64
-  function toBase64(text) {
-    return btoa(text);
-  }
-  
-  // 从Base64解码为字符串
-  function fromBase64(base64) {
-    try {
-      // 移除等号前缀(如果有)
-      const cleanBase64 = base64.startsWith('=') ? base64.substring(1) : base64;
-      return atob(cleanBase64);
-    } catch (e) {
-      console.error('Base64解码失败:', e, base64);
-      return '';
-    }
-  }
-  
-  // 混淆函数
-  function obfuscate(text) {
-    return text.split('').reverse().join('');
-  }
-  
-  // 反混淆函数
-  function deobfuscate(text) {
-    return text.split('').reverse().join('');
-  }
-  
-  // 加密函数
-  function encrypt(text) {
-    if (!text) return '';
-    const xorText = xorEncryptDecrypt(text, ENCRYPTION_KEY);
-    return obfuscate(toBase64(xorText));
-  }
-  
-  // 解密函数
-  function decrypt(encryptedText) {
-    if (!encryptedText) return '';
-    
-    try {
-      // 1. 移除前缀"="（如果有）
-      if (encryptedText.startsWith('=')) {
-        encryptedText = encryptedText.substring(1);
-      }
-      
-      // 2. 反转字符串（解混淆）
-      const obfuscatedText = encryptedText.split('').reverse().join('');
-      
-      // 3. Base64解码
-      const decodedText = atob(obfuscatedText);
-      
-      // 4. XOR解密
-      return xorDecrypt(decodedText, ENCRYPTION_KEY);
-    } catch (e) {
-      console.error('解密失败:', e);
-      return '';
-    }
-  }
-  
-  // XOR解密（与加密相同）
-  function xorDecrypt(text, key) {
-    let result = '';
-    for (let i = 0; i < text.length; i++) {
-      result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-    }
-    return result;
-  }
-  
-  return {
-    encrypt,
-    decrypt,
-    obfuscate,
-    deobfuscate
-  };
-})();
-
-// 确保在Service Worker环境中可用
-self.CryptoUtil = CryptoUtil;
-
 // MD5函数实现 - 确保在Service Worker中可用
 function MD5(string) {
   function rotateLeft(lValue, iShiftBits) {
@@ -301,20 +201,717 @@ function log(message, data) {
 }
 
 // 全局变量
-let currentTranslator = 'ollama'; // 默认使本地大模型翻译
+let currentTranslator = 'aliyun'; // 默认使用阿里云通用翻译
 let translationCache = {}; // 翻译缓存
 
-// 百度翻译API凭据 - 使用从配置文件导入的凭据
+// 百度凭据仍保留为旧版兼容入口；阿里云凭据只从 storage.local 读取。
+// 不要把任何真实密钥写入源码、manifest 或 content script。
 const BAIDU_CREDENTIALS = {
-  APPID: '', // 示例ID，请替换为实际ID
-  SECRET: '' // 示例密钥，请替换为实际密钥
+  APPID: '',
+  SECRET: ''
 };
 
-// 阿里云翻译API凭据 - 使用从配置文件导入的凭据
-const ALIYUN_CREDENTIALS =  {
-  ACCESS_KEY_ID: '', // 示例ID，请替换为实际ID
-  ACCESS_KEY_SECRET: '' // 示例密钥，请替换为实际密钥
-};
+const ALIYUN_STORAGE_KEYS = [
+  'aliyunAccessKeyId',
+  'aliyunAccessKeySecret'
+];
+
+function storageGet(keys) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.get(keys, result => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(result || {});
+    });
+  });
+}
+
+function storageSet(values) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.set(values, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function getAliyunCredentials() {
+  const settings = await storageGet(ALIYUN_STORAGE_KEYS);
+  return {
+    accessKeyId: (settings.aliyunAccessKeyId || '').trim(),
+    accessKeySecret: (settings.aliyunAccessKeySecret || '').trim()
+  };
+}
+
+function getPublicSettings(settings) {
+  return {
+    translationMode: settings.translationMode || 'light',
+    translationEngine: settings.translationEngine || currentTranslator,
+    ollamaEndpoint: settings.ollamaEndpoint || 'http://localhost:11434',
+    ollamaModel: settings.ollamaModel || ''
+  };
+}
+
+// Local app-core bridge. This is the manga-translator-ui shared mode, not its Web UI server.
+const MANGA_BACKEND_ENDPOINT = 'http://127.0.0.1:5003';
+const MANGA_BACKEND_PROTOCOL = 'manga-translator-ui-shared-v2';
+const MANGA_BACKEND_PROJECT_ROOT = '/Users/apple/Documents/github/manga-translator-ui';
+const MANGA_AIGATE_TEMP_OUTPUT_FOLDER = '/tmp/immersive-translate-output';
+const MANGA_BACKEND_READY_TTL_MS = 30000;
+const MANGA_BATCH_WINDOW_SIZE = 10;
+let mangaBackendReadyUntil = 0;
+let mangaBackendProbePromise = null;
+let mangaAigateReadyUntil = 0;
+const MANGA_NATIVE_HOST_NAME = 'com.timecyber.immersivetranslate.manga_backend';
+
+function sendNativeMessage(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendNativeMessage(MANGA_NATIVE_HOST_NAME, message, response => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(response || {});
+    });
+  });
+}
+
+async function mangaBackendReady() {
+  if (Date.now() < mangaBackendReadyUntil) return true;
+  if (mangaBackendProbePromise) return mangaBackendProbePromise;
+  mangaBackendProbePromise = (async () => {
+    try {
+      const response = await fetch(`${MANGA_BACKEND_ENDPOINT}/backend_info`, { cache: 'no-store' });
+      if (!response.ok) return false;
+      const info = await response.json();
+      const ready = info?.service === 'manga-translator-ui'
+        && info?.mode === 'shared'
+        && info?.protocol === MANGA_BACKEND_PROTOCOL
+        && Number(info?.configApiVersion) >= 1
+        && info?.projectRoot === MANGA_BACKEND_PROJECT_ROOT;
+      if (ready) mangaBackendReadyUntil = Date.now() + MANGA_BACKEND_READY_TTL_MS;
+      return ready;
+    } catch {
+      return false;
+    } finally {
+      mangaBackendProbePromise = null;
+    }
+  })();
+  // A failed probe is not cached; successful probes remain valid for the
+  // short TTL above so cache restoration does not issue one identity GET per page.
+  return mangaBackendProbePromise;
+}
+
+async function ensureMangaBackend(outputFolder = '') {
+  if (await mangaBackendReady()) return;
+  const response = await sendNativeMessage({
+    action: 'start',
+    outputFolder: String(outputFolder || '').trim(),
+  });
+  if (!response.success) {
+    throw new Error(response.error || '本地翻译后端启动失败');
+  }
+  mangaBackendReadyUntil = Date.now() + MANGA_BACKEND_READY_TTL_MS;
+}
+
+async function reloadMangaBackendConfig() {
+  const response = await fetch(`${MANGA_BACKEND_ENDPOINT}/reload_config`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    headers: { 'Content-Type': 'application/json' },
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`本机翻译配置刷新失败（HTTP ${response.status}）：${detail.slice(0, 240)}`);
+  }
+}
+
+async function getMangaTranslationBackend() {
+  const settings = await storageGet([
+    'mangaBackendMode',
+    'mangaAigateEndpoint',
+    'mangaAigateNonce',
+  ]);
+  const mode = settings.mangaBackendMode === 'aigate' ? 'aigate' : 'local';
+  if (mode === 'local') {
+    return { mode, endpoint: MANGA_BACKEND_ENDPOINT, nonce: '' };
+  }
+
+  let endpoint;
+  try {
+    const parsed = new URL(String(settings.mangaAigateEndpoint || ''));
+    if (parsed.protocol !== 'https:'
+      || !parsed.hostname.toLowerCase().endsWith('.waas.aigate.cc')
+      || parsed.username || parsed.password || parsed.port
+      || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+      throw new Error('地址不属于有效的 AIGate HTTP 6006 服务');
+    }
+    endpoint = parsed.origin;
+  } catch (error) {
+    throw new Error(error.message || '请先在漫画翻译页连接 AIGate 实例');
+  }
+  const nonce = String(settings.mangaAigateNonce || '').trim();
+  if (nonce.length < 24) throw new Error('AIGate 翻译服务凭据已失效，请重新启动云端服务');
+  return { mode, endpoint, nonce };
+}
+
+async function ensureMangaTranslationBackend(outputFolder = '', options = {}) {
+  await ensureMangaBackend(outputFolder);
+  const backend = await getMangaTranslationBackend();
+  if (backend.mode === 'local') {
+    if (options.reloadLocalConfig) await reloadMangaBackendConfig();
+    return backend;
+  }
+  if (options.reloadLocalConfig) await reloadMangaBackendConfig();
+  if (!options.verifyCloud && Date.now() < mangaAigateReadyUntil) return backend;
+  mangaAigateReadyUntil = 0;
+
+  let response;
+  try {
+    response = await fetch(`${backend.endpoint}/backend_info`, {
+      headers: { 'X-Nonce': backend.nonce },
+      cache: 'no-store',
+    });
+  } catch (error) {
+    throw new Error(`AIGate 翻译服务不可访问：${error.message || error}`);
+  }
+  if (!response.ok) throw new Error(`AIGate 翻译服务返回 HTTP ${response.status}`);
+  const info = await response.json();
+  if (info?.service !== 'manga-translator-ui'
+    || info?.mode !== 'shared'
+    || info?.protocol !== MANGA_BACKEND_PROTOCOL
+    || !(Number(info?.configApiVersion) >= 1)) {
+    throw new Error('AIGate 实例未运行支持统一配置的 manga-translator-ui 共享服务；请更新云端项目后重启服务');
+  }
+  mangaAigateReadyUntil = Date.now() + MANGA_BACKEND_READY_TTL_MS;
+  return backend;
+}
+
+async function saveMangaTranslationLocally({
+  taskId,
+  pageIndex,
+  sourceUrl,
+  imageUrl,
+  filename,
+  imageBytes,
+  outputFolder,
+}) {
+  if (!taskId || !Number.isInteger(pageIndex) || pageIndex < 0) return null;
+  const response = await fetch(
+    `${MANGA_BACKEND_ENDPOINT}/cache/task/${encodeURIComponent(taskId)}/image/${pageIndex}`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        image: typeof imageBytes === 'string' ? imageBytes : arrayBufferToBase64(imageBytes),
+        filename: filename || `page-${pageIndex + 1}.png`,
+        imageUrl: imageUrl || '',
+        sourceUrl: normaliseMangaSourceUrl(sourceUrl || ''),
+        outputFolder: outputFolder || undefined,
+      }),
+      headers: { 'Content-Type': 'application/json' },
+      cache: 'no-store',
+    },
+  );
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`翻译结果已返回，但本地保存失败（HTTP ${response.status}）：${detail.slice(0, 180)}`);
+  }
+  return response.json();
+}
+
+function normaliseMangaSourceUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    url.hash = '';
+    return url.href;
+  } catch {
+    return String(value || '').trim().slice(0, 4000);
+  }
+}
+
+async function getMangaOutputFolder() {
+  const settings = await storageGet(['mangaOutputFolder']);
+  return String(settings.mangaOutputFolder || '').trim();
+}
+
+async function getMangaTranslatorConfig() {
+  const stored = await storageGet(['mangaTranslatorConfig']);
+  if (stored.mangaTranslatorConfig && typeof stored.mangaTranslatorConfig === 'object'
+    && !Array.isArray(stored.mangaTranslatorConfig)) {
+    return stored.mangaTranslatorConfig;
+  }
+
+  const response = await sendNativeMessage({ action: 'readMangaConfig' });
+  if (!response.success || !response.config || typeof response.config !== 'object'
+    || Array.isArray(response.config)) {
+    throw new Error(response.error || '没有统一漫画翻译配置；请先导入配置文件或读取本机配置');
+  }
+  await storageSet({ mangaTranslatorConfig: response.config });
+  return response.config;
+}
+
+async function applyMangaTranslatorConfig(backend) {
+  const config = await getMangaTranslatorConfig();
+  let response;
+  try {
+    response = await fetch(`${backend.endpoint}/config/apply`, {
+      method: 'POST',
+      body: JSON.stringify({ config }),
+      headers: {
+        'Content-Type': 'application/json',
+        ...(backend.mode === 'aigate' ? { 'X-Nonce': backend.nonce } : {}),
+      },
+      cache: 'no-store',
+    });
+  } catch (error) {
+    throw new Error(`发送漫画翻译配置失败：${error.message || error}`);
+  }
+  if (!response.ok) {
+    const detail = await response.text();
+    if (response.status === 404) {
+      throw new Error('当前 manga-translator-ui 服务不支持统一配置接口，请更新本地/云端项目并重启共享服务');
+    }
+    throw new Error(`应用漫画翻译配置失败（HTTP ${response.status}）：${detail.slice(0, 240)}`);
+  }
+  const result = await response.json();
+  if (!result.success || !result.revision) throw new Error('翻译后端没有确认配置版本');
+  return result;
+}
+
+async function rememberMangaTask(sourceUrl, taskId, imageCount) {
+  const key = normaliseMangaSourceUrl(sourceUrl);
+  if (!key || !taskId) return;
+  const stored = await storageGet(['mangaTaskMap']);
+  const map = stored.mangaTaskMap && typeof stored.mangaTaskMap === 'object'
+    ? { ...stored.mangaTaskMap }
+    : {};
+  map[key] = { taskId: String(taskId), imageCount: Number(imageCount) || 0, updatedAt: Date.now() };
+  const recent = Object.entries(map)
+    .sort((left, right) => (right[1]?.updatedAt || 0) - (left[1]?.updatedAt || 0))
+    .slice(0, 100);
+  await storageSet({ mangaTaskMap: Object.fromEntries(recent) });
+}
+
+async function getMangaCache(taskId, sourceUrl, imageUrls) {
+  if (!taskId) return { success: true, found: false, pages: [] };
+  const outputFolder = await getMangaOutputFolder();
+  const sourceKey = normaliseMangaSourceUrl(sourceUrl);
+  const stored = await storageGet(['mangaTaskMap']);
+  const existingTask = stored.mangaTaskMap?.[sourceKey]?.taskId || '';
+  await rememberMangaTask(sourceUrl, taskId, imageUrls.length);
+  if (!(await mangaBackendReady())) {
+    // The browser map is only a fast path. Older tasks, imported-page tasks,
+    // and mappings lost during extension updates can still have a valid disk
+    // manifest, so probe the selected output directory before giving up.
+    let shouldStartBackend = existingTask && existingTask === taskId;
+    if (!shouldStartBackend) {
+      try {
+        const probe = await sendNativeMessage({
+          action: 'hasMangaCache',
+          taskId,
+          outputFolder,
+          sourceUrl,
+        });
+        shouldStartBackend = Boolean(probe?.success && probe.found);
+      } catch {
+        shouldStartBackend = false;
+      }
+    }
+    if (shouldStartBackend) {
+      await ensureMangaBackend(outputFolder);
+    } else {
+      return { success: true, found: false, pages: [], backendUnavailable: true };
+    }
+  }
+  const query = new URLSearchParams({
+    outputFolder,
+    sourceUrl: normaliseMangaSourceUrl(sourceUrl),
+  });
+  const response = await fetch(
+    `${MANGA_BACKEND_ENDPOINT}/cache/task/${encodeURIComponent(taskId)}/manifest?${query.toString()}`,
+    { cache: 'no-store' },
+  );
+  if (!response.ok) throw new Error(`读取翻译缓存失败（HTTP ${response.status}）`);
+  const cache = await response.json();
+  return {
+    success: true,
+    ...cache,
+  };
+}
+
+async function getMangaCachedImage(taskId, pageIndex, sourceUrl = '') {
+  const outputFolder = await getMangaOutputFolder();
+  await ensureMangaBackend(outputFolder);
+  const query = new URLSearchParams({
+    outputFolder,
+    sourceUrl: normaliseMangaSourceUrl(sourceUrl),
+  });
+  const response = await fetch(
+    `${MANGA_BACKEND_ENDPOINT}/cache/task/${encodeURIComponent(taskId)}/image/${encodeURIComponent(pageIndex)}?${query.toString()}`,
+    { cache: 'no-store' },
+  );
+  if (!response.ok) throw new Error(`读取缓存图片失败（HTTP ${response.status}）`);
+  const data = await response.arrayBuffer();
+  return {
+    success: true,
+    mimeType: response.headers.get('content-type') || 'image/png',
+    data: arrayBufferToBase64(data),
+    encoding: 'base64',
+  };
+}
+
+function decodeStreamJson(bytes) {
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
+function arrayBufferToBase64(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function readMangaImageStream(response) {
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    throw new Error('浏览器不支持读取翻译流');
+  }
+  const reader = response.body.getReader();
+  let buffer = new Uint8Array(0);
+  let resultBytes = null;
+
+  function append(left, right) {
+    const merged = new Uint8Array(left.byteLength + right.byteLength);
+    merged.set(left);
+    merged.set(right, left.byteLength);
+    return merged;
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value && value.byteLength) buffer = append(buffer, value);
+
+    while (buffer.byteLength >= 5) {
+      const status = buffer[0];
+      const length = (buffer[1] * 0x1000000)
+        + (buffer[2] * 0x10000)
+        + (buffer[3] * 0x100)
+        + buffer[4];
+      if (length > 256 * 1024 * 1024) {
+        throw new Error('翻译后端返回了过大的图片帧');
+      }
+      if (buffer.byteLength < 5 + length) break;
+      const payload = buffer.slice(5, 5 + length);
+      buffer = buffer.slice(5 + length);
+
+      if (status === 0) {
+        resultBytes = payload;
+      } else if (status === 2) {
+        const error = decodeStreamJson(payload);
+        throw new Error(error?.error || '翻译后端处理失败');
+      } else if (status !== 1) {
+        throw new Error(`翻译后端返回了未知状态：${status}`);
+      }
+    }
+
+    if (done) break;
+  }
+
+  if (buffer.byteLength) throw new Error('翻译后端返回了不完整的数据帧');
+  if (!resultBytes?.byteLength) throw new Error('翻译后端没有返回图片');
+  return resultBytes;
+}
+
+async function readMangaBatchStream(response, onEvent) {
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    throw new Error('浏览器不支持读取批量翻译流');
+  }
+  const reader = response.body.getReader();
+  let buffer = new Uint8Array(0);
+  let receivedDone = false;
+
+  function append(left, right) {
+    const merged = new Uint8Array(left.byteLength + right.byteLength);
+    merged.set(left);
+    merged.set(right, left.byteLength);
+    return merged;
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value && value.byteLength) buffer = append(buffer, value);
+
+    while (buffer.byteLength >= 5) {
+      const status = buffer[0];
+      const length = (buffer[1] * 0x1000000)
+        + (buffer[2] * 0x10000)
+        + (buffer[3] * 0x100)
+        + buffer[4];
+      if (length > 256 * 1024 * 1024) {
+        throw new Error('翻译后端返回了过大的批量帧');
+      }
+      if (buffer.byteLength < 5 + length) break;
+      const payload = buffer.slice(5, 5 + length);
+      buffer = buffer.slice(5 + length);
+
+      if (status === 1) {
+        await onEvent({ type: 'progress', text: new TextDecoder().decode(payload) });
+      } else if (status === 0 || status === 2 || status === 3) {
+        const event = decodeStreamJson(payload);
+        if (!event) throw new Error('翻译后端返回了无效的批量事件');
+        if (status === 2) {
+          await onEvent({ type: 'error', ...event });
+        } else {
+          await onEvent(event);
+        }
+        if (status === 3 || event.type === 'done') receivedDone = true;
+      } else {
+        throw new Error(`翻译后端返回了未知状态：${status}`);
+      }
+    }
+
+    if (done) break;
+  }
+
+  if (buffer.byteLength) throw new Error('翻译后端返回了不完整的批量数据帧');
+  if (!receivedDone) throw new Error('翻译后端未发送批量完成事件');
+}
+
+function postMangaBatchMessage(port, message) {
+  if (!port) return false;
+  try {
+    port.postMessage(message);
+    return true;
+  } catch (error) {
+    // The page can navigate away while the local translator is still working.
+    // Do not turn a normal port teardown into an unhandled background error.
+    console.warn('[漫画翻译] 页面端口已断开，停止回传批量结果:', error?.message || error);
+    return false;
+  }
+}
+
+function postMangaBatchEvent(port, event) {
+  if (!port) return false;
+  if (event.type === 'result') {
+    return postMangaBatchMessage(port, {
+      action: 'mangaBatchImage',
+      ...event,
+      data: event.data,
+      encoding: 'base64',
+    });
+  }
+  if (event.type === 'error') {
+    return postMangaBatchMessage(port, { action: 'mangaBatchImageError', ...event });
+  }
+  if (event.type === 'skipped') {
+    return postMangaBatchMessage(port, { action: 'mangaBatchImageSkipped', ...event });
+  }
+  if (event.type === 'done') {
+    return postMangaBatchMessage(port, { action: 'mangaBatchDone', ...event });
+  }
+  return true;
+}
+
+async function translateMangaBatchInBackground(entries, sourceUrl, taskId, batchSize, port) {
+  if (entries.length > MANGA_BATCH_WINDOW_SIZE) {
+    throw new Error(`单次批量翻译最多支持 ${MANGA_BATCH_WINDOW_SIZE} 张图片`);
+  }
+  const outputFolder = await getMangaOutputFolder();
+  await rememberMangaTask(sourceUrl, taskId, entries.length);
+  const backend = await ensureMangaTranslationBackend(outputFolder, { reloadLocalConfig: true });
+  const appliedConfig = await applyMangaTranslatorConfig(backend);
+
+  const fetched = await Promise.all(entries.map(async entry => {
+    try {
+      if (!/^https?:\/\//i.test(entry.url)) throw new Error('图片地址不是 HTTP/HTTPS');
+      const response = await fetch(entry.url, { credentials: 'omit', cache: 'no-store' });
+      if (!response.ok) throw new Error(`下载原图失败（HTTP ${response.status}）`);
+      const blob = await response.blob();
+      if (!blob.size) throw new Error('下载到空图片');
+      return {
+        ok: true,
+        entry,
+        image: arrayBufferToBase64(await blob.arrayBuffer()),
+      };
+    } catch (error) {
+      return { ok: false, entry, error: error.message || String(error) };
+    }
+  }));
+
+  const validEntries = [];
+  fetched.forEach(item => {
+    if (item.ok) {
+      validEntries.push({
+        image: item.image,
+        filename: item.entry.filename,
+        imageUrl: item.entry.url,
+        pageIndex: item.entry.pageIndex,
+      });
+    } else {
+      if (!postMangaBatchEvent(port, {
+        type: 'error',
+        taskId,
+        pageIndex: item.entry.pageIndex,
+        filename: item.entry.filename,
+        error: item.error,
+        stage: 'download',
+      })) {
+        throw new Error('漫画翻译页面已离开，停止回传批量结果');
+      }
+    }
+  });
+
+  if (!validEntries.length) {
+    if (!postMangaBatchEvent(port, {
+      type: 'done',
+      taskId,
+      success: false,
+      processed: 0,
+      total: entries.length,
+    })) {
+      throw new Error('漫画翻译页面已离开，停止回传批量结果');
+    }
+    return;
+  }
+
+  const response = await fetch(`${backend.endpoint}/execute_image/batch_translate`, {
+    method: 'POST',
+    body: JSON.stringify({
+      images: validEntries,
+      taskId,
+      sourceUrl: normaliseMangaSourceUrl(sourceUrl),
+      outputFolder: backend.mode === 'local'
+        ? (outputFolder || undefined)
+        : MANGA_AIGATE_TEMP_OUTPUT_FOLDER,
+      batchSize,
+      configRevision: appliedConfig.revision,
+    }),
+    headers: {
+      'Content-Type': 'application/json',
+      ...(backend.mode === 'aigate' ? { 'X-Nonce': backend.nonce } : {}),
+    },
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`App 批量翻译桥接失败（HTTP ${response.status}）：${detail.slice(0, 240)}`);
+  }
+
+  if (backend.mode === 'local') {
+    await readMangaBatchStream(response, event => {
+      if (!postMangaBatchEvent(port, event)) {
+        throw new Error('漫画翻译页面已离开，停止回传批量结果');
+      }
+    });
+    return;
+  }
+
+  await readMangaBatchStream(response, async event => {
+    if (event.type === 'result') {
+      try {
+        const saved = await saveMangaTranslationLocally({
+          taskId,
+          pageIndex: Number(event.pageIndex),
+          sourceUrl,
+          imageUrl: validEntries.find(entry => entry.pageIndex === Number(event.pageIndex))?.imageUrl || '',
+          filename: event.filename,
+          imageBytes: event.data,
+          outputFolder,
+        });
+        event.savedPath = saved?.path || '';
+      } catch (error) {
+        event.type = 'error';
+        event.error = error.message || String(error);
+        event.stage = 'local-save';
+        delete event.data;
+      }
+    }
+    if (!postMangaBatchEvent(port, event)) {
+      throw new Error('漫画翻译页面已离开，停止回传批量结果');
+    }
+  });
+}
+
+async function translateMangaImageInBackground(url, filename, options = {}) {
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error('只支持翻译 HTTP/HTTPS 图片');
+  }
+
+  const outputFolder = await getMangaOutputFolder();
+  if (options.sourceUrl && options.taskId) {
+    await rememberMangaTask(options.sourceUrl, options.taskId, 1);
+  }
+  const backend = await ensureMangaTranslationBackend(outputFolder, {
+    reloadLocalConfig: options.reloadConfig === true,
+  });
+  const appliedConfig = await applyMangaTranslatorConfig(backend);
+  const sourceResponse = await fetch(url, { credentials: 'omit', cache: 'no-store' });
+  if (!sourceResponse.ok) {
+    throw new Error(`下载原图失败（HTTP ${sourceResponse.status}）`);
+  }
+  const sourceBlob = await sourceResponse.blob();
+  if (!sourceBlob.size) throw new Error('下载到空图片');
+
+  const imageBase64 = arrayBufferToBase64(await sourceBlob.arrayBuffer());
+  const response = await fetch(`${backend.endpoint}/execute_image/translate`, {
+    method: 'POST',
+    body: JSON.stringify({
+      image: imageBase64,
+      filename: filename || 'manga-page.webp',
+      imageUrl: url,
+      taskId: options.taskId || '',
+      pageIndex: Number.isInteger(options.pageIndex) ? options.pageIndex : undefined,
+      sourceUrl: normaliseMangaSourceUrl(options.sourceUrl || ''),
+      outputFolder: backend.mode === 'local'
+        ? (outputFolder || undefined)
+        : MANGA_AIGATE_TEMP_OUTPUT_FOLDER,
+      configRevision: appliedConfig.revision,
+    }),
+    headers: {
+      'Content-Type': 'application/json',
+      ...(backend.mode === 'aigate' ? { 'X-Nonce': backend.nonce } : {}),
+    },
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`App 翻译桥接失败（HTTP ${response.status}）：${detail.slice(0, 180)}`);
+  }
+
+  const resultBytes = await readMangaImageStream(response);
+  let savedPath = '';
+  if (backend.mode === 'aigate' && options.taskId && Number.isInteger(options.pageIndex)) {
+    const saved = await saveMangaTranslationLocally({
+      taskId: options.taskId,
+      pageIndex: options.pageIndex,
+      sourceUrl: options.sourceUrl || '',
+      imageUrl: url,
+      filename: filename || 'manga-page.webp',
+      imageBytes: resultBytes,
+      outputFolder,
+    });
+    savedPath = saved?.path || '';
+  }
+  return {
+    success: true,
+    mimeType: 'image/png',
+    data: arrayBufferToBase64(resultBytes),
+    encoding: 'base64',
+    savedPath,
+  };
+}
 
 // Ollama翻译功能
 async function ollamaTranslate(text, from = 'auto', to = 'zh') {
@@ -498,8 +1095,8 @@ async function baiduTranslate(text, from = 'auto', to = 'zh') {
     });
 
     const salt = Date.now().toString();
-    const appid = BAIDU_CREDENTIALS.APPID;//CryptoUtil.decrypt(BAIDU_CREDENTIALS.APPID)
-    const key = BAIDU_CREDENTIALS.SECRET;//CryptoUtil.decrypt(BAIDU_CREDENTIALS.SECRET)
+    const appid = BAIDU_CREDENTIALS.APPID;
+    const key = BAIDU_CREDENTIALS.SECRET;
     
     // 检查API凭据
     if (!appid || appid.trim() === '' || !key || key.trim() === '') {
@@ -579,159 +1176,150 @@ async function baiduTranslate(text, from = 'auto', to = 'zh') {
   }
 }
 
-// 阿里云翻译API实现 - 权限错误处理增强
-async function aliyunTranslate(text, from = 'auto', to = 'zh') {
+// 阿里云翻译实现已统一到下方的 TranslateGeneral 版本。
+
+function percentEncode(value) {
+  return encodeURIComponent(String(value))
+    .replace(/[!'()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function createSignatureNonce() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function formatAliyunTimestamp() {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+async function hmacSha1Base64(message, secret) {
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi?.subtle) {
+    throw new Error('当前浏览器不支持 Web Crypto，无法生成阿里云签名');
+  }
+
+  const encoder = new TextEncoder();
+  const key = await cryptoApi.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+  const signature = await cryptoApi.subtle.sign('HMAC', key, encoder.encode(message));
+  return btoa(String.fromCharCode(...new Uint8Array(signature)));
+}
+
+// 阿里云机器翻译通用版 API（TranslateGeneral）。凭据只从 storage.local 读取。
+async function aliyunTranslate(text, from = 'auto', to = 'zh', credentialOverride = null) {
+  if (!text || text.length > 5000) {
+    throw new Error('阿里云通用翻译单次最多支持5000个字符');
+  }
+
+  const credentials = credentialOverride || await getAliyunCredentials();
+  const { accessKeyId, accessKeySecret } = credentials;
+  if (!accessKeyId || !accessKeySecret) {
+    throw new Error('尚未配置阿里云 AccessKey ID 和 AccessKey Secret，请打开扩展设置');
+  }
+
+  const apiUrl = 'https://mt.cn-hangzhou.aliyuncs.com';
+  const params = {
+    AccessKeyId: accessKeyId,
+    Action: 'TranslateGeneral',
+    Format: 'JSON',
+    FormatType: 'text',
+    Scene: 'general',
+    SignatureMethod: 'HMAC-SHA1',
+    SignatureNonce: createSignatureNonce(),
+    SignatureVersion: '1.0',
+    SourceLanguage: from || 'auto',
+    SourceText: text,
+    TargetLanguage: to || 'zh',
+    Timestamp: formatAliyunTimestamp(),
+    Version: '2018-10-12'
+  };
+
+  const canonicalizedQueryString = Object.keys(params)
+    .sort()
+    .map(key => `${percentEncode(key)}=${percentEncode(params[key])}`)
+    .join('&');
+  const stringToSign = `POST&${percentEncode('/')}&${percentEncode(canonicalizedQueryString)}`;
+  const signature = await hmacSha1Base64(stringToSign, `${accessKeySecret}&`);
+  const requestBody = `${canonicalizedQueryString}&Signature=${percentEncode(signature)}`;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
   try {
-    console.log('🔄 [阿里云翻译] 开始翻译...', {
-      文本长度: text.length,
-      原文预览: text.substring(0, 50) + (text.length > 50 ? '...' : ''),
-      源语言: from,
-      目标语言: to
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'Accept': 'application/json'
+      },
+      body: requestBody
     });
 
-    const accessKeyId = ALIYUN_CREDENTIALS.ACCESS_KEY_ID;//CryptoUtil.decrypt(ALIYUN_CREDENTIALS.ACCESS_KEY_ID)
-    const accessKeySecret = ALIYUN_CREDENTIALS.ACCESS_KEY_SECRET;//CryptoUtil.decrypt(ALIYUN_CREDENTIALS.ACCESS_KEY_SECRET)
-    
-    // 检查API凭据
-    if (!accessKeyId || accessKeyId.trim() === '' || !accessKeySecret || accessKeySecret.trim() === '') {
-      throw new Error('阿里云翻译API凭据无效或未配置');
-    }
-    
-    // 使用阿里云推荐的通用翻译API端点
-    const endpoint = 'mt.cn-hangzhou.aliyuncs.com';
-    const apiUrl = `https://${endpoint}`;
-    
-    // 请求参数
-    const date = new Date();
-    const timestamp = date.toISOString();
-    const requestId = Math.random().toString(36).substring(2, 15);
-    
-    // 通用参数 - 使用更简单的电商翻译API
-    const commonParams = {
-      Format: 'JSON',
-      Version: '2018-10-12',
-      AccessKeyId: accessKeyId,
-      SignatureMethod: 'HMAC-SHA1',
-      Timestamp: timestamp,
-      SignatureVersion: '1.0',
-      SignatureNonce: requestId,
-      Action: 'TranslateECommerce',  // 尝试使用电商翻译API，需要相应权限
-    };
-    
-    // 业务参数
-    const businessParams = {
-      FormatType: 'text',
-      SourceLanguage: from === 'auto' ? 'auto' : from,
-      TargetLanguage: to,
-      SourceText: text,
-      Scene: 'general',
-    };
-    
-    // 合并所有参数
-    const allParams = { ...commonParams, ...businessParams };
-    
-    // 创建规范化的查询字符串
-    const sortedKeys = Object.keys(allParams).sort();
-    const canonicalizedQueryString = sortedKeys
-      .map(key => encodeURIComponent(key) + '=' + encodeURIComponent(allParams[key]))
-      .join('&');
-    
-    // 构建签名字符串
-    const stringToSign = 'POST&' + encodeURIComponent('/') + '&' + encodeURIComponent(canonicalizedQueryString);
-    
-    // 计算签名
-    const key = accessKeySecret + '&';
-    const signature = CryptoJS.HmacSHA1(stringToSign, key).toString(CryptoJS.enc.Base64);
-    
-    // 添加签名到参数
-    allParams.Signature = signature;
-    
-    // 构建URL参数字符串
-    const queryString = Object.keys(allParams)
-      .map(key => encodeURIComponent(key) + '=' + encodeURIComponent(allParams[key]))
-      .join('&');
-    
-    log('发送阿里云翻译请求:', { 
-      text: text.substring(0, 30) + (text.length > 30 ? '...' : ''), 
-      from, 
-      to,
-      url: apiUrl
-    });
-    
-    // 创建AbortController用于请求超时
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
-    
+    const responseText = await response.text();
+    let data;
     try {
-      // 发送请求
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Accept': 'application/json'
-        },
-        body: queryString
-      });
-      
-      // 清除超时计时器
-      clearTimeout(timeoutId);
-      
-      // 检查响应状态
-      if (!response.ok) {
-        const errorText = await response.text();
-        log('阿里云翻译响应错误:', { 
-          status: response.status,
-          statusText: response.statusText,
-          body: errorText
-        });
-        
-        // 检查是否是权限错误
-        if (errorText.includes('NoPermission') || errorText.includes('AccessDenied')) {
-          throw new Error('阿里云翻译API权限错误: 请确保您的账户有权调用机器翻译API。请登录阿里云控制台检查RAM权限设置。');
-        }
-        
-        throw new Error(`HTTP错误: ${response.status} ${response.statusText} - ${errorText}`);
-      }
-      
-      const data = await response.json();
-      
-      // 详细记录响应
-      log('阿里云翻译响应:', data);
-      
-      if (data.Code && data.Code !== '200') {
-        throw new Error(`阿里云翻译错误: ${data.Code} - ${data.Message}`);
-      }
-      
-      if (data.Data && data.Data.Translated) {
-        console.log('✅ [阿里云翻译] 翻译成功', {
-          原文预览: text.substring(0, 50) + (text.length > 50 ? '...' : ''),
-          译文预览: data.Data.Translated.substring(0, 50) + (data.Data.Translated.length > 50 ? '...' : '')
-        });
-        return data.Data.Translated;
-      } else {
-        const resultStr = JSON.stringify(data);
-        throw new Error(`阿里云翻译返回结果格式错误: ${resultStr.substring(0, 100)}`);
-      }
-    } catch (fetchError) {
-      // 清除超时计时器
-      clearTimeout(timeoutId);
-      
-      // 处理不同类型的网络错误
-      if (fetchError.name === 'AbortError') {
-        throw new Error('阿里云翻译API请求超时');
-      } else if (fetchError.message.includes('Failed to fetch') || 
-                fetchError.message.includes('Network request failed')) {
-        throw new Error('网络连接失败，无法连接到阿里云翻译API');
-      } else {
-        throw fetchError; // 重新抛出其他错误
-      }
+      data = JSON.parse(responseText);
+    } catch {
+      throw new Error(`阿里云翻译返回了非 JSON 响应（HTTP ${response.status}）`);
     }
+
+    if (!response.ok) {
+      const message = data.Message || data.message || response.statusText;
+      throw new Error(`阿里云翻译请求失败（HTTP ${response.status}）：${message}`);
+    }
+
+    const result = data.TranslateGeneralResponse || data;
+    const code = Number(result.Code);
+    if (code !== 200) {
+      throw new Error(`阿里云翻译错误：${result.Code || '未知错误'} - ${result.Message || '请检查服务权限和计费状态'}`);
+    }
+
+    const translated = result.Data && result.Data.Translated;
+    if (!translated) {
+      throw new Error('阿里云翻译返回结果中没有译文');
+    }
+    return translated;
   } catch (error) {
-    console.error('❌ [阿里云翻译] 发生错误:', error.message);
+    if (error.name === 'AbortError') {
+      throw new Error('阿里云翻译请求超时');
+    }
+    if (error.message.includes('Failed to fetch') || error.message.includes('Network request failed')) {
+      throw new Error('无法连接阿里云翻译服务，请检查网络和扩展权限');
+    }
     throw error;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
+
+chrome.runtime.onConnect.addListener(port => {
+  if (port.name !== 'manga-batch') return;
+
+  port.onMessage.addListener(request => {
+    if (request.action === 'mangaBatchKeepAlive') return;
+    if (request.action !== 'translateMangaBatchInPage') return;
+    if (!postMangaBatchMessage(port, { action: 'mangaBatchStarted', taskId: request.taskId })) return;
+    translateMangaBatchInBackground(
+      Array.isArray(request.entries) ? request.entries : [],
+      request.sourceUrl || '',
+      request.taskId || '',
+      Math.max(1, Math.min(Number(request.batchSize) || MANGA_BATCH_WINDOW_SIZE, MANGA_BATCH_WINDOW_SIZE)),
+      port,
+    ).catch(error => {
+      postMangaBatchMessage(port, {
+        action: 'mangaBatchFailed',
+        error: error.message || String(error),
+      });
+    });
+  });
+});
 
 // 监听消息
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -741,6 +1329,131 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'ping') {
     console.log('[后台脚本] 收到ping请求，回复成功');
     sendResponse({ success: true, message: "后台脚本正在运行" });
+    return true;
+  }
+
+  if (request.action === 'getSettings') {
+    storageGet(['translationMode', 'translationEngine', 'ollamaEndpoint', 'ollamaModel'])
+      .then(settings => sendResponse({ success: true, settings: getPublicSettings(settings) }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (request.action === 'prepareMangaTranslation') {
+    getMangaOutputFolder()
+      .then(outputFolder => ensureMangaTranslationBackend(outputFolder, {
+        reloadLocalConfig: true,
+        verifyCloud: true,
+      }))
+      .then(backend => sendResponse({ success: true, backend: backend.mode }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (request.action === 'applyMangaTranslatorConfig') {
+    (async () => {
+      const outputFolder = await getMangaOutputFolder();
+      const backend = await ensureMangaTranslationBackend(outputFolder, {
+        reloadLocalConfig: request.reloadLocalConfig !== false,
+        verifyCloud: true,
+      });
+      const result = await applyMangaTranslatorConfig(backend);
+      sendResponse({
+        success: true,
+        backend: backend.mode,
+        revision: result.revision,
+        changed: result.changed,
+        persisted: result.persisted,
+      });
+    })().catch(error => sendResponse({ success: false, error: error.message || String(error) }));
+    return true;
+  }
+
+  if (request.action === 'getMangaCache') {
+    const imageUrls = Array.isArray(request.imageUrls) ? request.imageUrls : [];
+    getMangaCache(request.taskId, request.sourceUrl, imageUrls)
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (request.action === 'getMangaCachedImage') {
+    getMangaCachedImage(request.taskId, request.pageIndex, request.sourceUrl)
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (request.action === 'translateMangaImageInPage') {
+    translateMangaImageInBackground(request.url, request.filename, request)
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (request.action === 'openMangaTranslatorFromPage') {
+    const page = request.page || {};
+    const imageUrls = Array.isArray(page.imageUrls)
+      ? page.imageUrls.filter(url => typeof url === 'string' && /^https?:\/\//i.test(url)).slice(0, 100)
+      : [];
+    if (!imageUrls.length) {
+      sendResponse({ success: false, error: '当前网页没有可翻译图片' });
+      return true;
+    }
+      const pageData = {
+        title: String(page.title || '当前网页章节').slice(0, 200),
+        sourceUrl: String(page.sourceUrl || '').slice(0, 2000),
+        imageUrls,
+        autoStart: true,
+      };
+    const targetUrl = `${chrome.runtime.getURL('manga/manga.html')}?pageData=${encodeURIComponent(JSON.stringify(pageData))}`;
+    chrome.tabs.create({ url: targetUrl }, tab => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ success: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      sendResponse({ success: true, tabId: tab.id });
+    });
+    return true;
+  }
+
+  if (request.action === 'getTranslatorInfo') {
+    Promise.all([
+      getAliyunCredentials(),
+      storageGet(['translationEngine'])
+    ]).then(([credentials, settings]) => sendResponse({
+      success: true,
+      currentTranslator: settings.translationEngine || currentTranslator,
+      baiduAvailable: Boolean(BAIDU_CREDENTIALS.APPID && BAIDU_CREDENTIALS.SECRET),
+      aliyunAvailable: Boolean(credentials.accessKeyId && credentials.accessKeySecret)
+    })).catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (request.action === 'switchTranslator') {
+    const supportedTranslators = ['ollama', 'baidu', 'aliyun'];
+    if (!supportedTranslators.includes(request.translator)) {
+      sendResponse({ success: false, error: '不支持的翻译引擎' });
+      return true;
+    }
+    currentTranslator = request.translator;
+    storageSet({
+      translationEngine: currentTranslator,
+      preferred_translator: currentTranslator
+    }).then(() => sendResponse({ success: true, currentTranslator }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (request.action === 'testAliyun') {
+    (async () => {
+      try {
+        const translation = await aliyunTranslate('Hello', 'en', 'zh', request.credentials || null);
+        sendResponse({ success: true, translation });
+      } catch (error) {
+        sendResponse({ success: false, error: error.message || '阿里云连接测试失败' });
+      }
+    })();
     return true;
   }
   
@@ -774,7 +1487,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         
         let translation;
         
-        console.log('[后台脚本] 当前翻译引擎:', translationEngine || 'ollama', 
+        console.log('[后台脚本] 当前翻译引擎:', translationEngine || 'aliyun',
                     '源语言:', from, '目标语言:', to);
         
         // 根据选择的引擎调用相应的翻译函数
@@ -813,7 +1526,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   
   if (request.action === "settingsUpdated") {
     // 设置更新通知
-    console.log("[Background] 接收到设置更新通知:", request.settings);
+    console.log("[Background] 翻译设置已更新:", request.settings?.translationEngine || 'unchanged');
+    if (request.settings && request.settings.translationEngine) {
+      currentTranslator = request.settings.translationEngine;
+    }
     sendResponse({ success: true, message: "设置更新已接收" });
     return true;
   }

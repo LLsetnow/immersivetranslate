@@ -1,0 +1,1005 @@
+{
+  "version": 1,
+  "source": "manga-translator-ui settings tab layout and current setting catalog",
+  "tabs": [
+    {
+      "id": "tab_custom_1",
+      "title": "通用",
+      "items": [
+        {
+          "kind": "field",
+          "key": "cli.verbose",
+          "label": "详细日志",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "Qt UI 启动时，无论此项是否开启，都会在 result/ 目录创建 log_时间戳.txt 运行日志。\n\n开启后，控制台会显示 DEBUG 级别信息；每张已处理图片还会创建带时间戳的调试文件夹，保存输入图、检测/OCR、修复和渲染等调试缓存/中间文件。这些文件可能很多并占用大量磁盘空间，建议只在排查问题时开启。\n\n清理方法：先关闭 Qt UI，再到 result/ 目录删除不需要的 log_*.txt 和带时间戳的调试文件夹即可。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.ignore_errors",
+          "label": "忽略错误",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "遇到错误时忽略并继续处理后续图片，不中断整个任务。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.use_gpu",
+          "label": "使用 GPU",
+          "control": "toggle",
+          "defaultValue": true,
+          "description": "启用 GPU 加速。需要 CUDA 支持，可大幅提升处理速度。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.disable_onnx_gpu",
+          "label": "禁用 ONNX GPU 加速",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "禁用 ONNX Runtime GPU 加速。如果 GPU 模式出现兼容问题，可尝试启用此选项。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.format",
+          "label": "输出格式",
+          "control": "combo",
+          "defaultValue": "不指定",
+          "description": "输出图片格式。可选 PNG、JPG/JPEG/JFIF、WebP、AVIF、BMP、TIFF/TIF、HEIC/HEIF，或留空保持原格式。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.overwrite",
+          "label": "覆盖已存在文件",
+          "control": "toggle",
+          "defaultValue": true,
+          "description": "覆盖已存在的翻译文件。关闭时会跳过已翻译的图片，并自动从跳过页的历史记录中恢复上下文。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.skip_no_text",
+          "label": "跳过无文本图像",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "跳过没有检测到文本的图片，减少不必要的处理。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.save_text",
+          "label": "图片可编辑",
+          "control": "toggle",
+          "defaultValue": true,
+          "description": "保存翻译结果到 JSON 文件，用于后续在编辑器中修改。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.save_quality",
+          "label": "图像保存质量",
+          "control": "int-input",
+          "defaultValue": 100,
+          "description": "JPEG/WebP/AVIF/HEIC 保存质量 (0-100)。值越高画质越好，文件越大。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.attempts",
+          "label": "重试次数",
+          "control": "int-input",
+          "defaultValue": 3,
+          "description": "调用 API 出错时的重试次数。设为 -1 表示无限重试。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.batch_size",
+          "label": "批量大小",
+          "control": "int-input",
+          "defaultValue": 3,
+          "description": "一次性发送多少张图片的原文给翻译器翻译（默认 3）。值越大速度越快，但翻译难度更高、返回更慢、更容易出错。建议 1-10。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.batch_concurrent",
+          "label": "并发批量处理",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "启用批量并发处理，多张图片同时翻译以提升效率。"
+        },
+        {
+          "kind": "field",
+          "key": "use_custom_api_params",
+          "label": "使用自定义API参数",
+          "control": "toggle + edit-custom-api-params action",
+          "defaultValue": true,
+          "description": "按当前模型匹配参数预设，找不到时回退“通用”；每个 API 模块只读取 common 和自身分组。适用于翻译、AI 识别、AI 渲染、AI 上色。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.save_to_source_dir",
+          "label": "输出到原图目录",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "将翻译结果输出到原图目录的 manga_translator_work/result/ 子目录中。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.generate_long_image",
+          "label": "生成翻译长图",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "翻译任务完成后，将本次成功生成的所有图片按当前顺序从上到下拼接，并在输出目录额外生成一张 PNG 长图。原始结果不会被修改；跳过页和失败页不会加入。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.generate_html",
+          "label": "生成任务 HTML",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "翻译任务完成后，将本次任务的图片写入一个离线 HTML 文件。图片以 Base64 原数据内嵌，不依赖原图片路径；跳过页只要已有输出文件也会加入。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.html_view_mode",
+          "label": "HTML 查看方式",
+          "control": "combo",
+          "defaultValue": "scroll",
+          "description": "选择生成的 HTML 打开后的默认查看方式。连续滚动使用 ↑ / ↓，分页查看使用 ← / →。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.export_editable_psd",
+          "label": "导出可编辑PSD",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "导出分图层的 PSD 文件。需要安装 Photoshop。导出内容包括原图、修复图和可编辑文本层，输出到原图所在目录下的 manga_translator_work/psd/。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.psd_script_only",
+          "label": "仅生成PSD脚本",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "只生成 .jsx 脚本，不自动启动 Photoshop，也不会直接生成 PSD。脚本会保存到原图所在目录下的 manga_translator_work/psd/，适合手动检查或自行执行导出。"
+        },
+        {
+          "kind": "field",
+          "key": "app.unload_models_after_translation",
+          "label": "翻译完成后卸载模型",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "翻译完成后卸载所有模型以释放显存和内存。适合显存不足的场景，但下次翻译需要重新加载。"
+        }
+      ]
+    },
+    {
+      "id": "tab_custom_5",
+      "title": "文字识别",
+      "items": [
+        {
+          "kind": "field",
+          "key": "ocr.ocr_mode",
+          "label": "OCR 类型",
+          "control": "combo",
+          "defaultValue": "local",
+          "description": "OCR 类型二选一：选择本地 OCR 后，只显示本地 OCR 模型；选择 AI VLM OCR 后，只显示视觉语言模型及其相关配置。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.ocr",
+          "label": "OCR模型",
+          "control": "combo",
+          "defaultValue": "hayai_ocr_v2",
+          "description": "OCR 识别模型。32px：旧版轻量模型，可作兼容性备选；48px：默认推荐，速度和准确率较均衡；48px_ctc：48px 的 CTC 变体，可作对比；mocr：日漫专用模型；paddleocr：通用多语言模型；paddleocr_korean / paddleocr_latin / paddleocr_thai：分别适合韩文、拉丁字母文本、泰文，其中文本为英文时建议优先用 paddleocr_latin；paddleocr_vl：通用模型，效果最好但最吃配置，建议在下方的 PaddleOCR-VL 语言提示 中选择对应语言，或填写 PaddleOCR-VL 自定义提示词；openai_ocr：调用 OpenAI 兼容多模态接口做 OCR；gemini_ocr：调用 Gemini 多模态接口做 OCR。两者都需先在 API密钥(.env) 中填写对应 API Key，否则 UI 不会开始翻译；通常效果最好，但和本地 OCR 差距往往不大，而且会按文本框大量消耗请求次数，如果是按次收费的站点不建议使用。Google Cloud / Vertex 相关 API Key 也直接填写 Gemini 对应配置；Base URL 保持默认官方地址即可，无需修改。若启用混合 OCR，日漫推荐 48px + mocr。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.use_hybrid_ocr",
+          "label": "启用混合OCR",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "同时使用两个 OCR 模型进行识别，取最佳结果以提高准确率。日漫推荐组合：48px + mocr。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.secondary_ocr",
+          "label": "备用OCR",
+          "control": "combo",
+          "defaultValue": "mocr",
+          "description": "混合 OCR 时使用的第二个 OCR 模型。日漫推荐与主 OCR 的 48px 搭配使用 mocr。若这里选择 openai_ocr / gemini_ocr，也需要先在 API密钥(.env) 中填写对应 API Key，否则 UI 不会开始翻译。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.ai_ocr_prompt_path",
+          "label": "AI OCR 提示词",
+          "control": "prompt-editor-button",
+          "defaultValue": null,
+          "description": "OpenAI OCR / Gemini OCR 使用固定的 YAML 提示词文件。点击 Edit 直接编辑内容。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.ai_ocr_concurrency",
+          "label": "AI OCR 并发数",
+          "control": "int-input",
+          "defaultValue": 10,
+          "description": "OpenAI OCR / Gemini OCR 的最大并发请求数。1 表示串行识别，2 及以上会同时请求多个文本框。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.ocr_vl_language_hint",
+          "label": "VLM OCR 语言提示",
+          "control": "combo",
+          "defaultValue": "Japanese",
+          "description": "供 PaddleOCR-VL 等视觉语言 OCR 模型使用的语言提示。不支持提示词的模型会忽略此设置。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.ocr_vl_custom_prompt",
+          "label": "VLM OCR 自定义提示词（优先）",
+          "control": "optional-input",
+          "defaultValue": null,
+          "description": "供 PaddleOCR-VL 等视觉语言 OCR 模型使用的自定义提示词。不支持提示词的模型会忽略此设置。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.use_model_bubble_filter",
+          "label": "启用模型气泡过滤",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "启用模型气泡过滤，使用 AI 判断文本是否在气泡内以过滤非对话文字。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.min_text_length",
+          "label": "最小文本长度",
+          "control": "int-input",
+          "defaultValue": 0,
+          "description": "最小文本长度。过滤掉识别结果中长度小于此值的文本区域。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.ignore_bubble",
+          "label": "忽略非气泡文本",
+          "control": "float-input",
+          "defaultValue": 0.0,
+          "description": "智能过滤非气泡区域文本 (0-1)。0=禁用，0.3=宽松，0.7=严格。通过分析边缘黑白比例判断是否为气泡。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.merge_special_require_full_wrap",
+          "label": "模型辅助合并",
+          "control": "toggle",
+          "defaultValue": true,
+          "description": "模型标签辅助合并：某种程度下能改善文本框合并效果。开启后先执行模型辅助预合并，无标签框必须被完全包裹才参与预合并。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.model_bubble_overlap_threshold",
+          "label": "模型气泡重叠阈值",
+          "control": "float-input",
+          "defaultValue": 0.1,
+          "description": "模型气泡重叠阈值，控制气泡检测框的重叠判定。"
+        },
+        {
+          "kind": "field",
+          "key": "filter_text_enabled",
+          "label": "启用过滤列表",
+          "control": "toggle + open-filter-list action",
+          "defaultValue": false,
+          "description": "启用过滤列表。OCR 识别的原文包含过滤词时，该文本区域会被完全跳过。"
+        },
+        {
+          "kind": "divider",
+          "title": "高级"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.prob",
+          "label": "文本区域最低概率 (prob)",
+          "control": "float-input",
+          "defaultValue": 0.1,
+          "description": "OCR 识别概率阈值 (0-1)。低于此值的文本会被过滤掉。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.merge_gamma",
+          "label": "合并-距离容忍度",
+          "control": "float-input",
+          "defaultValue": 0.8,
+          "description": "文本区域合并时的距离容忍度。值越大，距离越远的文本框也会被合并。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.merge_sigma",
+          "label": "合并-离群容忍度",
+          "control": "float-input",
+          "defaultValue": 2.5,
+          "description": "文本区域合并时的离群容忍度。控制离群文本的合并程度。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.merge_edge_ratio_threshold",
+          "label": "合并-边缘距离比例阈值",
+          "control": "float-input",
+          "defaultValue": 0.0,
+          "description": "边缘比率阈值，控制边缘文本的合并条件。"
+        }
+      ]
+    },
+    {
+      "id": "tab_custom_7",
+      "title": "检测",
+      "items": [
+        {
+          "kind": "field",
+          "key": "detector.detector",
+          "label": "文本检测器",
+          "control": "combo",
+          "defaultValue": "default",
+          "description": "文本检测算法。default 使用 DBNet+ResNet34；ctd 专门针对漫画文本；craft 通用文本检测。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.import_yolo_labels",
+          "label": "导入固定YOLO框",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "从 manga_translator_work/yolo_labels 读取与图片同名的 YOLO 标注文件。在不同工作流下按约定替换检测框或补生成蒙版。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.use_yolo_obb",
+          "label": "启用YOLO辅助检测",
+          "control": "toggle",
+          "defaultValue": true,
+          "description": "使用 YOLO 有向边界框辅助检测，提高文本检测准确率。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.use_sfx_filter",
+          "label": "拟声词过滤",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "过滤既未被 YOLO other 框包裹、也未与其他 YOLO OBB 检测框达到重叠阈值的主检测框。需同时启用 YOLO 辅助检测。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.sfx_filter_include_bubble_text",
+          "label": "气泡文本参与拟声词过滤",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "开启后，气泡内文本也参与拟声词过滤；关闭时，气泡内文本无条件保留。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.min_box_area_ratio",
+          "label": "最小检测框面积占比",
+          "control": "int-input",
+          "defaultValue": 0,
+          "description": "最小检测框面积占比 (相对于图片总像素)。过滤掉面积过小的检测框。建议 0.0005-0.002。"
+        },
+        {
+          "kind": "divider",
+          "title": "高级"
+        },
+        {
+          "kind": "field",
+          "key": "detector.detection_size",
+          "label": "检测大小",
+          "control": "int-input",
+          "defaultValue": 2048,
+          "description": "检测时的图像缩放尺寸。默认 2048，越大越准确但越慢。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.det_rearrange_min_effective_short_side",
+          "label": "长图重排最低有效短边",
+          "control": "int-input",
+          "defaultValue": 341,
+          "description": "长图检测重排后保留的最低有效短边分辨率。默认 341，值越高文字越清晰但检测越慢。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.text_threshold",
+          "label": "文本阈值",
+          "control": "float-input",
+          "defaultValue": 0.5,
+          "description": "文本检测置信度阈值 (0-1)。越高越严格，可能漏检。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.box_threshold",
+          "label": "边界框生成阈值",
+          "control": "float-input",
+          "defaultValue": 0.5,
+          "description": "文本框生成的置信度阈值。值越低检测到的文本框越多。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.unclip_ratio",
+          "label": "Unclip比例",
+          "control": "float-input",
+          "defaultValue": 2.5,
+          "description": "Unclip 比例，控制文本框的扩展程度。值越大框越大。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.yolo_obb_conf",
+          "label": "YOLO置信度阈值",
+          "control": "float-input",
+          "defaultValue": 0.4,
+          "description": "YOLO 辅助检测的置信度阈值。值越高越严格。"
+        },
+        {
+          "kind": "field",
+          "key": "detector.yolo_obb_overlap_threshold",
+          "label": "YOLO辅助检测重叠率删除阈值",
+          "control": "float-input",
+          "defaultValue": 0.1,
+          "description": "YOLO 框重叠阈值，用于去除重叠的检测框。"
+        }
+      ]
+    },
+    {
+      "id": "tab_custom_2",
+      "title": "翻译",
+      "items": [
+        {
+          "kind": "field",
+          "key": "translator.translator",
+          "label": "翻译器",
+          "control": "combo",
+          "defaultValue": "openai",
+          "description": "选择翻译引擎。当前 Qt UI 可选翻译器包括 OpenAI、Google Gemini、阿里云机器翻译、Sakura、高质量翻译 OpenAI、高质量翻译 Gemini，以及“不翻译”“保留原文”。推荐高质量翻译 OpenAI。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.thinking_level",
+          "label": "思考强度",
+          "control": "combo",
+          "defaultValue": "auto",
+          "description": "控制支持该功能的 AI 翻译模型的思考强度。“自动”使用服务商默认值；阿里云机器翻译不支持此设置。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.target_lang",
+          "label": "目标语言",
+          "control": "combo",
+          "defaultValue": "CHS",
+          "description": "翻译的目标语言。支持简体中文、繁体中文、英语、日语、韩语等。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.keep_lang",
+          "label": "保留源语言",
+          "control": "combo",
+          "defaultValue": "none",
+          "description": "文本框合并完成后，按识别出的源语言过滤后续处理区域；不匹配的区域会保持原图，不擦除、不翻译、不渲染。设为“不过滤”则禁用此功能。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.enable_streaming",
+          "label": "启用流式传输",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "启用后，OpenAI/Gemini（含高质量模式）会优先使用统一流式传输层实时接收增量响应；关闭后始终使用普通非流式请求。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.no_text_lang_skip",
+          "label": "不跳过目标语言文本",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "不跳过已是目标语言的文本，强制进行翻译。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.extract_glossary",
+          "label": "自动提取新术语",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "自动从翻译结果中提取人名、地名等专有名词，确保长篇漫画翻译一致性。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.max_requests_per_minute",
+          "label": "每分钟最大请求数",
+          "control": "int-input",
+          "defaultValue": 0,
+          "description": "每分钟最大请求数。设为 0 表示不限制。用于避免触发 API 速率限制。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.remove_trailing_period",
+          "label": "自动移除末尾句号逗号",
+          "control": "toggle",
+          "defaultValue": true,
+          "description": "当原文结尾没有标点时，自动移除译文末尾额外补上的句号、逗号（如 。/. /．/，/︐）。不会删除顿号。"
+        },
+        {
+          "kind": "field",
+          "key": "cli.context_size",
+          "label": "上下文页数",
+          "control": "int-input",
+          "defaultValue": 3,
+          "description": "翻译上下文页面数，用于多页联合翻译。值越大翻译质量越好，但 token 消耗越多。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.convert_to_traditional",
+          "label": "简体转繁体",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "翻译后将简体中文转换为繁体中文（使用 OpenCC s2twp 台湾用词标准）。"
+        },
+        {
+          "kind": "field",
+          "key": "translator.convert_to_simplified",
+          "label": "繁体转简体",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "翻译后将繁体中文转换为简体中文（使用 OpenCC t2s）。"
+        }
+      ]
+    },
+    {
+      "id": "tab_custom_3",
+      "title": "修复",
+      "items": [
+        {
+          "kind": "field",
+          "key": "inpainter.inpainter",
+          "label": "修复模型",
+          "control": "combo",
+          "defaultValue": "lama_large",
+          "description": "图像修复算法。lama_large 效果最好（推荐）；lama_mpe 速度快；flux2-klein 使用 FLUX.2 Klein 4B，质量高但显存和速度要求更高；default 使用 AOT。"
+        },
+        {
+          "kind": "field",
+          "key": "mask_dilation_offset",
+          "label": "遮罩扩张偏移",
+          "control": "int-input",
+          "defaultValue": 50,
+          "description": "蒙版膨胀偏移量 (默认 70)。控制文本擦除区域的扩展程度，值越大擦除范围越广。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.limit_mask_dilation_to_bubble_mask",
+          "label": "膨胀不超过气泡蒙版",
+          "control": "toggle",
+          "defaultValue": true,
+          "description": "限制蒙版膨胀范围不超出气泡区域，防止气泡边框被误擦除。"
+        },
+        {
+          "kind": "field",
+          "key": "ocr.use_model_bubble_repair_intersection",
+          "label": "扩大气泡修复范围",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "使用模型气泡区域与修复蒙版取交集，精确控制修复范围。"
+        },
+        {
+          "kind": "field",
+          "key": "inpainter.solid_fill_pure_bubbles",
+          "label": "纯色气泡直接填色",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "使用气泡模型匹配文本所在气泡并判断背景是否接近纯色；实际填色仅限于优化修复蒙版与气泡蒙版的交集，填色后跳过对应区域的修复模型。模型未命中或交集为空时交给修复模型处理。"
+        },
+        {
+          "kind": "field",
+          "key": "inpainter.per_block_inpainting",
+          "label": "逐块修复",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "将优化蒙版按孤立连通块分别裁取 2 倍窗口修复，并将每块反射补成正方形，因此不会进入长图切片流程。由于每块可用上下文更少，复杂背景的修复效果可能变差；在 CPU 下，小裁窗可能提高推理速度。关闭则整页一次喂给模型。"
+        },
+        {
+          "kind": "divider",
+          "title": "高级"
+        },
+        {
+          "kind": "field",
+          "key": "inpainter.inpainting_size",
+          "label": "修复大小",
+          "control": "int-input",
+          "defaultValue": 2048,
+          "description": "修复处理时的图像尺寸。越大效果越好但越慢。"
+        },
+        {
+          "kind": "field",
+          "key": "inpainter.inpainting_precision",
+          "label": "修复精度",
+          "control": "combo",
+          "defaultValue": "fp32",
+          "description": "修复精度。fp32 最准确但最慢；fp16 平衡；bf16 推荐。"
+        },
+        {
+          "kind": "field",
+          "key": "kernel_size",
+          "label": "卷积核大小",
+          "control": "int-input",
+          "defaultValue": 3,
+          "description": "文本擦除卷积核大小 (默认 3)。控制文本擦除的精细程度。"
+        },
+        {
+          "kind": "field",
+          "key": "inpainter.force_use_torch_inpainting",
+          "label": "强制使用PyTorch修复",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "强制使用 PyTorch 引擎修复 (默认 CPU 优先用 ONNX)。适用于 ONNX 出问题时。"
+        }
+      ]
+    },
+    {
+      "id": "tab_custom_4",
+      "title": "排版",
+      "items": [
+        {
+          "kind": "field",
+          "key": "render.renderer",
+          "label": "渲染器",
+          "control": "combo",
+          "defaultValue": "default",
+          "description": "渲染引擎。default 默认渲染器；openai_renderer / gemini_renderer 需要先在 API密钥(.env) 中填写对应 API Key，否则 UI 不会开始翻译。Google Cloud / Vertex 相关 API Key 也直接填写 Gemini 对应配置；Base URL 保持默认官方地址即可，无需修改。"
+        },
+        {
+          "kind": "field",
+          "key": "render.font_family",
+          "label": "字体",
+          "control": "font-combo + open-font-directory action",
+          "defaultValue": "Microsoft YaHei UI",
+          "description": "选择嵌字和可编辑 PSD 文本层使用的字体。下拉列表包含操作系统已安装的系统字体，以及项目 fonts 目录中的字体文件；把 .ttf、.otf 或 .ttc 文件放入该目录后，重新打开下拉列表即可刷新。"
+        },
+        {
+          "kind": "field",
+          "key": "render.disable_system_fonts",
+          "label": "禁止使用系统字体库",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "开启后字体列表只显示项目 fonts 目录中的字体，不再使用操作系统安装的系统字体。"
+        },
+        {
+          "kind": "field",
+          "key": "render.ai_renderer_prompt_path",
+          "label": "AI 渲染提示词",
+          "control": "prompt-editor-button",
+          "defaultValue": null,
+          "description": "OpenAI 渲染 / Gemini 渲染使用固定的 YAML 提示词文件。实际请求会自动组合编号框图片和对应翻译文本。"
+        },
+        {
+          "kind": "field",
+          "key": "render.ai_renderer_concurrency",
+          "label": "AI 渲染并发数",
+          "control": "int-input",
+          "defaultValue": 1,
+          "description": "OpenAI 渲染 / Gemini 渲染的最大并发请求数。批量模式下可同时渲染多张页面。"
+        },
+        {
+          "kind": "field",
+          "key": "render.alignment",
+          "label": "对齐方式",
+          "control": "combo",
+          "defaultValue": "auto",
+          "description": "文本对齐方式。auto 自动检测；left 左对齐；center 居中；right 右对齐。"
+        },
+        {
+          "kind": "field",
+          "key": "render.semantic_linebreak",
+          "label": "中文语义断句",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "使用本地 HanLP 模型按中文短语进行自动断句。目前仅支持中文译文；模型缺失时自动回退普通断句。"
+        },
+        {
+          "kind": "field",
+          "key": "render.remove_linebreak_punctuation",
+          "label": "去除换行符周围逗号句号",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "删除换行符周围的逗号、句号，避免标点贴在换行边缘。不会删除顿号、问号、感叹号、省略号。"
+        },
+        {
+          "kind": "field",
+          "key": "render.disable_auto_wrap",
+          "label": "AI断句",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "禁用自动换行。启用 AI 断句时建议开启。"
+        },
+        {
+          "kind": "field",
+          "key": "render.optimize_line_breaks",
+          "label": "AI断句自动扩大文字",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "AI 断句优化：自动调整字体大小以减少不必要的断行，提升可读性。需配合 OpenAI/Gemini 翻译器。"
+        },
+        {
+          "kind": "field",
+          "key": "render.strict_smart_scaling",
+          "label": "AI断句自动扩大文字下不扩大文本框",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "严格智能缩放：AI 断句时不扩大文本框，只通过缩小字体来适应。"
+        },
+        {
+          "kind": "field",
+          "key": "render.balloon_fill_mask_layout",
+          "label": "气泡蒙版排版",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "无显式断行时按气泡蒙版最大内接范围自动断句；有显式断行时保留断点，以文本框中心为锚点并扩大字号搜索范围；后续文字框与已有文字框重叠时，缩小到最大不重叠字号。默认关闭。"
+        },
+        {
+          "kind": "field",
+          "key": "render.check_br_and_retry",
+          "label": "AI断句检查",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "检查 AI 断句结果，不符合要求则自动重试。⚠️ 注意：可能会陷入无限循环，请谨慎使用。"
+        },
+        {
+          "kind": "field",
+          "key": "render.stroke_width",
+          "label": "描边宽度比例",
+          "control": "float-input",
+          "defaultValue": 0.07,
+          "description": "字体描边宽度比例 (默认 0.07)。相对于字体大小，范围 0.0-1.0。设为 0 禁用描边。"
+        },
+        {
+          "kind": "field",
+          "key": "render.disable_font_border",
+          "label": "禁用字体边框",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "禁用字体描边效果（去除文字边框）。"
+        },
+        {
+          "kind": "field",
+          "key": "render.center_text_in_bubble",
+          "label": "气泡内居中",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "文本块在气泡框内居中显示。"
+        },
+        {
+          "kind": "field",
+          "key": "render.font_size_offset",
+          "label": "字体大小偏移量",
+          "control": "int-input",
+          "defaultValue": 0,
+          "description": "字体大小偏移量。正数增大字体，负数减小字体。"
+        },
+        {
+          "kind": "field",
+          "key": "render.font_size_minimum",
+          "label": "最小字体大小",
+          "control": "int-input",
+          "defaultValue": 0,
+          "description": "最小字体大小限制，防止字体过小导致不可读。"
+        },
+        {
+          "kind": "field",
+          "key": "render.direction",
+          "label": "文本方向",
+          "control": "combo",
+          "defaultValue": "auto",
+          "description": "文字方向。auto 自动检测；horizontal 水平排列；vertical 垂直排列。"
+        },
+        {
+          "kind": "field",
+          "key": "render.uppercase",
+          "label": "大写",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "将所有文本转换为大写字母。"
+        },
+        {
+          "kind": "field",
+          "key": "render.lowercase",
+          "label": "小写",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "将所有文本转换为小写字母。"
+        },
+        {
+          "kind": "field",
+          "key": "render.no_hyphenation",
+          "label": "禁用连字符",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "禁用连字符换行。"
+        },
+        {
+          "kind": "field",
+          "key": "render.bubble_layout_english",
+          "label": "根据气泡排版(强制横排)",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "开启后对所有语言使用气泡形状排版并强制横排。英文默认已启用此排版方式，此开关主要影响韩文、中文等其他语言。"
+        },
+        {
+          "kind": "field",
+          "key": "render.font_color",
+          "label": "字体颜色",
+          "control": "input",
+          "defaultValue": null,
+          "description": "字体颜色，使用十六进制颜色代码 (如 #FFFFFF)。留空则自动检测。"
+        },
+        {
+          "kind": "field",
+          "key": "render.line_spacing",
+          "label": "行间距",
+          "control": "float-input",
+          "defaultValue": 1.0,
+          "description": "行间距倍率 (默认 1.0)。调节行与行之间的空隙，范围 0.1-5.0。"
+        },
+        {
+          "kind": "field",
+          "key": "render.letter_spacing",
+          "label": "字间距",
+          "control": "float-input",
+          "defaultValue": 1.0,
+          "description": "字间距倍率 (默认 1.0)。调节字符推进距离，范围 0.1-5.0。"
+        },
+        {
+          "kind": "field",
+          "key": "render.font_size",
+          "label": "字体大小",
+          "control": "optional-input",
+          "defaultValue": null,
+          "description": "固定字体大小，覆盖自动计算。留空使用自动大小。"
+        },
+        {
+          "kind": "field",
+          "key": "render.rtl",
+          "label": "从右到左",
+          "control": "toggle",
+          "defaultValue": true,
+          "description": "启用从右到左 (RTL) 排版，适用于阿拉伯语、希伯来语等。"
+        },
+        {
+          "kind": "field",
+          "key": "render.layout_mode",
+          "label": "排版模式",
+          "control": "combo",
+          "defaultValue": "balloon_fill",
+          "description": "排版模式。smart_scaling 为智能缩放；strict 为严格边界；balloon_fill 为智能气泡（推荐）。"
+        },
+        {
+          "kind": "field",
+          "key": "render.max_font_size",
+          "label": "最大字体大小",
+          "control": "int-input",
+          "defaultValue": 0,
+          "description": "最大字体大小限制。"
+        },
+        {
+          "kind": "field",
+          "key": "render.font_scale_ratio",
+          "label": "字体缩放比例",
+          "control": "float-input",
+          "defaultValue": 1.0,
+          "description": "字体整体缩放比例。"
+        }
+      ]
+    },
+    {
+      "id": "tab_custom_6",
+      "title": "模式相关",
+      "items": [
+        {
+          "kind": "divider",
+          "title": "文本导出"
+        },
+        {
+          "kind": "field",
+          "key": "cli.export_from_local_json",
+          "label": "仅从本地 JSON 导出文本",
+          "control": "toggle",
+          "defaultValue": true,
+          "description": "导出翻译和导出原文时，只读取本地已有工程 JSON 并生成文本副文件；不重新检测图片、不执行 OCR、不调用翻译 API，也不回写工程 JSON，避免覆盖已修改的译文。"
+        },
+        {
+          "kind": "divider",
+          "title": "翻译替换"
+        },
+        {
+          "kind": "field",
+          "key": "render.enable_template_alignment",
+          "label": "启用直接粘贴模式",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "直接粘贴模式：根据坐标匹配从翻译图裁剪区域粘贴到生肉图，保留原始字体样式。仅替换翻译模式下生效。"
+        },
+        {
+          "kind": "field",
+          "key": "render.paste_mask_dilation_pixels",
+          "label": "粘贴模式蒙版膨胀大小",
+          "control": "int-input",
+          "defaultValue": 10,
+          "description": "粘贴前扩大蒙版区域的像素数 (默认 10)。设为 0 禁用膨胀。"
+        },
+        {
+          "kind": "divider",
+          "title": "超分"
+        },
+        {
+          "kind": "field",
+          "key": "upscale.upscaler",
+          "label": "超分模型",
+          "control": "combo",
+          "defaultValue": "mangajanai",
+          "description": "超分辨率模型。waifu2x 默认；realcugan 推荐；mangajanai ⭐ 效果最好但最吃配置。"
+        },
+        {
+          "kind": "field",
+          "key": "upscale.upscale_ratio",
+          "label": "超分倍数",
+          "control": "dynamic-combo",
+          "defaultValue": null,
+          "description": "超分辨率放大倍数。不使用 = 不超分；2/3/4 = 放大对应倍数。"
+        },
+        {
+          "kind": "field",
+          "key": "upscale.tile_size",
+          "label": "分块大小(0=不分割)",
+          "control": "int-input",
+          "defaultValue": 400,
+          "description": "分块处理大小 (0=不分割)。将大图分割成小块处理以降低显存占用。建议 200-800。"
+        },
+        {
+          "kind": "field",
+          "key": "upscale.revert_upscaling",
+          "label": "还原超分",
+          "control": "toggle",
+          "defaultValue": false,
+          "description": "翻译后恢复原始分辨率，避免输出图片变大。"
+        },
+        {
+          "kind": "divider",
+          "title": "上色"
+        },
+        {
+          "kind": "field",
+          "key": "colorizer.colorizer",
+          "label": "上色模型",
+          "control": "combo",
+          "defaultValue": "none",
+          "description": "上色器类型。none = 不上色。openai_colorizer / gemini_colorizer 需要先在 API密钥(.env) 中填写对应 API Key，否则 UI 不会开始翻译。Google Cloud / Vertex 相关 API Key 也直接填写 Gemini 对应配置；Base URL 保持默认官方地址即可，无需修改。"
+        },
+        {
+          "kind": "field",
+          "key": "colorizer.ai_colorizer_prompt_path",
+          "label": "AI 上色提示词",
+          "control": "prompt-editor-button",
+          "defaultValue": null,
+          "description": "OpenAI 上色 / Gemini 上色使用固定的 YAML 提示词文件。点击 Edit 直接编辑内容。"
+        },
+        {
+          "kind": "field",
+          "key": "colorizer.ai_colorizer_history_pages",
+          "label": "AI 上色历史页数",
+          "control": "int-input",
+          "defaultValue": 0,
+          "description": "自动把前面已经上完色的页面当作参考图附加到当前页上色请求中。这里只控制历史页数，不写文字，只传图片。设为 0 表示关闭。"
+        },
+        {
+          "kind": "field",
+          "key": "colorizer.colorization_size",
+          "label": "上色大小",
+          "control": "int-input",
+          "defaultValue": 2048,
+          "description": "上色处理尺寸。越大效果越好但越慢。"
+        },
+        {
+          "kind": "field",
+          "key": "colorizer.denoise_sigma",
+          "label": "降噪强度",
+          "control": "int-input",
+          "defaultValue": 30,
+          "description": "去噪强度，控制上色后的降噪程度。"
+        }
+      ]
+    }
+  ],
+  "unassigned": []
+}

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>漫画翻译配置</title>
+  <link rel="stylesheet" href="manga.css">
+  <link rel="stylesheet" href="config.css">
+</head>
+<body>
+  <main class="page-shell config-shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">统一本地与云端 · MANGA CONFIGURATION</p>
+        <h1>漫画翻译配置</h1>
+        <p class="subtitle">沿用 manga-translator-ui 的设置分组。当前配置会同时用于本地 App 和 AIGate 云端实例。</p>
+      </div>
+      <a class="button secondary back-link" href="manga.html">返回章节翻译</a>
+    </header>
+
+    <section class="panel config-toolbar-panel">
+      <div class="config-toolbar">
+        <div class="toolbar-group">
+          <button id="import-config" class="button secondary" type="button">导入配置文件</button>
+          <button id="load-local-config" class="button secondary" type="button">读取本机配置</button>
+          <button id="export-config" class="button secondary" type="button">导出配置</button>
+          <input id="config-file" type="file" accept="application/json,.json" hidden>
+        </div>
+        <div class="toolbar-group">
+          <button id="save-config" class="button secondary" type="button">保存到扩展</button>
+          <button id="apply-config" class="button primary" type="button">应用到当前后端</button>
+        </div>
+      </div>
+      <p id="config-status" class="config-status" aria-live="polite">正在读取配置…</p>
+      <p class="config-note">配置保存在此浏览器的本地扩展存储中。应用时会发送到当前选择的本地或云端后端；AIGate 仅在运行中的服务进程内使用配置，不会将配置文件写入共享磁盘。导出文件会包含配置中的所有字段（包括其中已有的密钥）。</p>
+    </section>
+
+    <section class="panel settings-panel">
+      <div class="settings-heading">
+        <div>
+          <h2>设置项目</h2>
+          <p>数值与开关可直接编辑；有候选值的设置支持搜索，也可以保留或输入 manga-translator-ui 的原始值。</p>
+        </div>
+        <label class="settings-search">
+          <span class="visually-hidden">筛选当前分组</span>
+          <input id="settings-search" type="search" placeholder="筛选当前分组…">
+        </label>
+      </div>
+      <nav id="settings-tabs" class="settings-tabs" aria-label="配置分组"></nav>
+      <div id="settings-fields" class="settings-fields"></div>
+    </section>
+
+    <section class="panel extras-panel">
+      <details>
+        <summary>其他配置与当前设置页未列出的字段</summary>
+        <p>导入文件中的其他配置也会完整保留并参与本地/云端翻译。可在下方直接编辑这些字段的 JSON。</p>
+        <textarea id="extra-config" rows="12" spellcheck="false" aria-label="其他配置 JSON"></textarea>
+      </details>
+    </section>
+  </main>
+  <script src="config.js"></script>
+</body>
+</html>

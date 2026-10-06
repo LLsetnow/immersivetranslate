@@ -1,0 +1,9 @@
+{
+  "name": "com.timecyber.immersivetranslate.manga_backend",
+  "description": "启动 ImmersiveTranslate 使用的 manga-translator-ui App 核心桥接",
+  "path": "/Users/apple/Documents/github/immersivetranslate/native-host/manga_backend_host",
+  "type": "stdio",
+  "allowed_extensions": [
+    "immersivetranslate@timecyber.local"
+  ]
+}

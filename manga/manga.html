@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>漫画章节翻译</title>
+  <link rel="stylesheet" href="manga.css">
+</head>
+<body>
+  <main class="page-shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">网页实时翻译 · MANGA WORKFLOW</p>
+        <h1>漫画章节翻译</h1>
+      <p class="subtitle">在漫画网站直接点击右下角“翻译本章”即可自动检查后端并开始处理；也支持备用的章节 HTML 导入。</p>
+      </div>
+      <div class="hero-tools">
+        <a class="button secondary" href="config.html">漫画翻译配置</a>
+        <div class="hero-badge">本地 / AIGate</div>
+      </div>
+    </header>
+
+    <section class="panel backend-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>翻译后端</h2>
+          <p>本地模式使用当前电脑的 Manga Translator；云端模式通过 AIGate GPU 实例运行同一项目，翻译图片会上传到云端，结果自动保存回本地输出目录。</p>
+        </div>
+      </div>
+      <label class="backend-mode-control">
+        <span>选择后端</span>
+        <select id="manga-backend-mode">
+          <option value="local">本地 App</option>
+          <option value="aigate">AIGate 云端 GPU</option>
+        </select>
+      </label>
+      <div id="aigate-controls" class="aigate-controls" hidden>
+        <div class="form-grid">
+          <label>
+            <span>AIGate Bearer Token</span>
+            <input id="manga-aigate-token" type="password" autocomplete="off" placeholder="填写 AIGate Token">
+          </label>
+          <label>
+            <span>区域</span>
+            <select id="manga-aigate-area">
+              <option value="华东一区">华东一区</option>
+              <option value="华东二区">华东二区</option>
+            </select>
+          </label>
+          <label>
+            <span>GPU 规格</span>
+            <select id="manga-aigate-sku" disabled>
+              <option value="">先刷新云扉资源</option>
+            </select>
+          </label>
+          <label>
+            <span>个人镜像</span>
+            <select id="manga-aigate-image" disabled>
+              <option value="">先刷新云扉资源</option>
+            </select>
+          </label>
+          <label>
+            <span>已有实例</span>
+            <select id="manga-aigate-instance" disabled>
+              <option value="">没有可用实例</option>
+            </select>
+          </label>
+        </div>
+        <div class="toolbar aigate-actions">
+          <button id="refresh-aigate-resources" class="button secondary" type="button">读取 GPU、镜像和实例</button>
+          <button id="create-aigate-instance" class="button primary" type="button" disabled>创建并启动云端服务</button>
+          <button id="start-aigate-instance" class="button secondary" type="button" disabled>在所选实例启动服务</button>
+          <button id="check-aigate-service" class="button secondary" type="button" disabled>检查连通性</button>
+          <button id="stop-aigate-instance" class="button secondary" type="button" disabled>停止实例</button>
+        </div>
+        <p id="aigate-status" class="hint" aria-live="polite">可在已有实例中启动或复用翻译服务进程，并检查 HTTP 6006 连通性。AIGate Token 仅保存在本机扩展存储；创建实例可能产生云扉费用。</p>
+      </div>
+    </section>
+
+    <section class="panel source-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>1. 选择翻译来源</h2>
+          <p>网页入口会自动传入当前章节图片；下方 HTML 导入支持普通 <code>&lt;img&gt;</code>、懒加载属性，以及 <code>slides_p_path</code> Base64 图片数组。</p>
+        </div>
+        <span id="image-count" class="count-badge">未读取</span>
+      </div>
+
+      <label class="file-drop" for="chapter-html">
+        <input id="chapter-html" type="file" accept=".html,.htm,text/html">
+        <span class="file-icon">↥</span>
+        <strong id="file-label">选择或拖入章节 HTML（备用）</strong>
+        <span>图片地址只在本地解析，不会上传 HTML 文件。</span>
+      </label>
+
+      <div class="form-grid">
+        <label>
+          <span>本地 App 核心桥接地址</span>
+          <input id="server-endpoint" type="url" value="http://127.0.0.1:5003" readonly spellcheck="false">
+        </label>
+        <label>
+          <span>图片基础地址（HTML 没有绝对 URL 时填写）</span>
+          <input id="source-base" type="url" placeholder="例如 https://example.com/chapter/" spellcheck="false">
+        </label>
+      </div>
+
+      <div class="path-setting">
+        <label for="manga-output-folder">
+          <span>插件独立保存路径</span>
+          <div class="path-control">
+            <input id="manga-output-folder" type="text" placeholder="留空则使用 App 当前输出目录" spellcheck="false">
+            <button id="choose-output-folder" class="button secondary" type="button">选择文件夹</button>
+          </div>
+        </label>
+        <p>翻译结果和章节缓存清单会保存到此目录；缓存图片不占用浏览器 storage 配额。</p>
+      </div>
+
+      <p id="app-config-note" class="app-config-note">本地模式读取本机 <code>manga-translator-ui/config/config.json</code>；AIGate 模式会在实例的 <code>/home/waas</code> 中定位项目和虚拟环境，通过 HTTP 6006 提交图片。译图会回传并保存到上方选择的本地目录。</p>
+
+      <div class="toolbar">
+        <button id="start-backend" class="button secondary" type="button">启动 App 核心桥接</button>
+        <button id="test-server" class="button secondary" type="button">测试 App 核心桥接</button>
+        <button id="pause-translation" class="button secondary" type="button" disabled>暂停翻译</button>
+        <button id="translate-chapter" class="button primary" type="button" disabled>开始翻译章节</button>
+      </div>
+      <p class="hint">本地模式由 <code>127.0.0.1:5003</code> 执行翻译；AIGate 模式把图片发送到云端实例，再由本机桥接保存结果。Firefox/Zen 首次使用前，请运行项目内的 <code>native-host/install-macos.sh</code> 安装一次本机启动器。</p>
+    </section>
+
+    <section class="panel progress-panel" aria-live="polite">
+      <div class="progress-meta">
+        <span id="status-text">等待当前网页或章节来源</span>
+        <span id="progress-text">0 / 0</span>
+      </div>
+      <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+    </section>
+
+    <section class="panel logs-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>翻译后端实时日志</h2>
+          <p id="backend-log-status">正在等待后端日志</p>
+        </div>
+        <div class="log-actions">
+          <button id="clear-backend-log" class="button secondary" type="button">清空显示</button>
+          <button id="toggle-backend-log" class="button secondary" type="button">隐藏日志</button>
+        </div>
+      </div>
+      <pre id="backend-log" class="backend-log" aria-live="polite"></pre>
+    </section>
+
+    <section class="panel images-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>图片列表</h2>
+          <p id="chapter-title">从网页入口或 HTML 导入后显示章节图片。</p>
+        </div>
+        <button id="download-html" class="button secondary" type="button" disabled>下载翻译版 HTML</button>
+      </div>
+      <div id="image-grid" class="image-grid empty-state">
+        <div class="empty-icon">▧</div>
+        <p>尚未读取图片</p>
+      </div>
+    </section>
+  </main>
+  <script src="manga.js"></script>
+</body>
+</html>

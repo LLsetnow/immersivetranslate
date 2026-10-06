@@ -516,6 +516,11 @@ function isChineseText(text) {
 // 处理选定文本的翻译
 async function handleTextSelection(e) {
   try {
+    // Firefox/Zen 使用独立的右下角小点触发器，避免这里自动弹出翻译卡片。
+    if (window.__immersiveSelectionTriggerActive) {
+      return;
+    }
+
     // 获取选中的文本
     const selection = window.getSelection();
     const selectedText = selection.toString().trim();
@@ -1284,4 +1289,4 @@ function fallbackToStorageSettings() {
       log('加载设置时出错:', error);
     }
   });
-} 
+}

@@ -838,31 +838,9 @@ async function baiduTranslate(text, from = 'auto', to = 'zh') {
                 '- 用户secret是否存在:', !!secret,
                 '- 用户appid长度:', appid?.length || 0);
     
-    // 如果用户设置的凭据不可用，从background.js获取默认凭据
+    // 不再从后台脚本请求默认凭据；扩展不内置或回传任何密钥。
     if (!appid || !secret) {
-      console.log('用户凭据不可用，尝试获取默认凭据');
-      
-      return new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage(
-          { action: 'getApiCredentials' },
-          function(response) {
-            if (chrome.runtime.lastError) {
-              reject(new Error('获取API凭据失败: ' + chrome.runtime.lastError.message));
-              return;
-            }
-            
-            if (response && response.apiKey && response.apiSecret) {
-              console.log('成功获取默认凭据，长度:', response.apiKey.length);
-              // 使用获取的凭据执行翻译
-              baiduTranslateWithCredentials(text, from, to, response.apiKey, response.apiSecret)
-                .then(resolve)
-                .catch(reject);
-            } else {
-              reject(new Error('无法获取有效的API凭据'));
-            }
-          }
-        );
-      });
+      throw new Error('百度翻译凭据未配置，请在扩展设置中配置可用的翻译引擎');
     }
     
     // 使用用户设置的凭据
@@ -898,13 +876,6 @@ async function baiduTranslateWithCredentials(text, from, to, appid, secret) {
   // 确保md5函数可用
   ensureMd5Available();
   
-  // 记录凭据信息
-  console.log('使用API凭据进行翻译:',
-              '- appid:', appid,
-              '- appid长度:', appid.length,
-              '- secret前2位:', secret.substring(0, 2),
-              '- secret长度:', secret.length);
-              
   try {
     // 验证凭据格式
     if (!appid || appid.length < 5 || !secret || secret.length < 5) {
@@ -919,19 +890,8 @@ async function baiduTranslateWithCredentials(text, from, to, appid, secret) {
     const salt = Date.now().toString();
     const signStr = appid + text + salt + secret;
     
-    // 记录签名详情
-    console.log('签名详细信息:',
-               '- appid长度:', appid.length,
-               '- text长度:', text.length, 
-               '- salt:', salt,
-               '- secret长度:', secret.length);
-               
     // 使用正确的MD5函数计算签名
     const sign = MD5(signStr);
-    
-    console.log('生成签名:',
-              '- 完整签名字符串长度:', signStr.length,
-              '- 生成的MD5签名:', sign);
     
     // 使用POST方法发送请求
     const params = new URLSearchParams();
@@ -942,10 +902,7 @@ async function baiduTranslateWithCredentials(text, from, to, appid, secret) {
     params.append('salt', salt);
     params.append('sign', sign);
     
-    // 打印完整请求
-    console.log('完整请求参数:', params.toString());
-    
-    // 发送请求并记录完整响应
+    // 发送请求；不在日志中记录请求参数、签名或响应原文。
     const response = await fetch('https://fanyi-api.baidu.com/api/trans/vip/translate', {
       method: 'POST',
       headers: {
@@ -954,9 +911,7 @@ async function baiduTranslateWithCredentials(text, from, to, appid, secret) {
       body: params
     });
     
-    console.log('API响应状态:', response.status, response.statusText);
     const responseText = await response.text();
-    console.log('API响应原文:', responseText);
     
     // 解析响应
     const data = JSON.parse(responseText);
@@ -1100,42 +1055,6 @@ if (!window.translatorModule) {
   if (!window.translatorModule.hideTranslationPopup) window.translatorModule.hideTranslationPopup = hideTranslationPopup;
 }
 
-console.log('translator.js已加载完成');
-
-function useDefaultCredentials() {
-  console.log('使用默认API凭据');
-  
-  // 确保CryptoUtil可用
-  ensureCryptoUtil();
-  
-  try {
-    // 使用完整的解密过程
-    apiKey = CryptoUtil.decrypt(ENCRYPTED_API_KEY);
-    apiSecret = CryptoUtil.decrypt(ENCRYPTED_API_SECRET);
-    
-    // 清理可能的空格和不可见字符
-    if (apiKey) apiKey = apiKey.trim();
-    if (apiSecret) apiSecret = apiSecret.trim();
-    
-    console.log('默认API凭据解密结果:',
-               '- apiKey:', apiKey,
-               '- apiKey长度:', apiKey?.length || 0,
-               '- apiSecret长度:', apiSecret?.length || 0);
-    
-    if (!apiKey || !apiSecret || apiKey.length < 8 || apiSecret.length < 8) {
-      console.error('API凭据解密可能失败 - 长度不足或为空');
-      return false;
-    }
-    
-    return true;
-  } catch (e) {
-    console.error('解密默认API凭据失败:', e);
-    apiKey = '';
-    apiSecret = '';
-    return false;
-  }
-}
-
 // 当用户选择文本时，获取选中文本和DOM边界信息
 function getSelectedTextWithDomBoundaries() {
   const selection = window.getSelection();
@@ -1211,4 +1130,3 @@ function translateSelectedText() {
     }
   });
 }
-

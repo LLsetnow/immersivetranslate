@@ -33,63 +33,9 @@ const batchState = {
   maxConcurrent: 2     // 最大同时翻译请求数
 };
 
-// 将关键函数暴露到全局作用域，使content.js可以访问
-window.createSidebarButton = createSidebarButton;
+// 将全文翻译能力暴露到全局作用域，保留脚本接口但不再创建悬浮入口
 window.toggleTranslation = toggleTranslation;
 window.translateVisibleContent = translateVisibleContent;
-
-// 创建侧边栏翻译按钮
-function createSidebarButton() {
-  console.log('[侧边栏翻译] 创建侧边栏翻译按钮');
-  
-  // 检查按钮是否已存在
-  if (document.querySelector('.translator-sidebar-button')) {
-    console.log('[侧边栏翻译] 按钮已存在，不重复创建');
-    return;
-  }
-  
-  // 创建按钮
-  const button = document.createElement('div');
-  button.className = 'translator-sidebar-button';
-  button.textContent = '译';
-  button.title = '点击开始/停止全文翻译';
-  
-  // 设置按钮样式，确保可见
-  button.style.position = 'fixed';
-  button.style.bottom = '100px';
-  button.style.right = '20px';
-  button.style.width = '50px';
-  button.style.height = '50px';
-  button.style.backgroundColor = '#2196F3';
-  button.style.color = '#ffffff';
-  button.style.borderRadius = '50%';
-  button.style.display = 'flex';
-  button.style.alignItems = 'center';
-  button.style.justifyContent = 'center';
-  button.style.fontSize = '20px';
-  button.style.fontWeight = 'bold';
-  button.style.boxShadow = '0 2px 5px rgba(0, 0, 0, 0.3)';
-  button.style.cursor = 'pointer';
-  button.style.zIndex = '999999';
-  
-  // 添加到文档
-  document.body.appendChild(button);
-  
-  // 添加点击事件
-  button.addEventListener('click', toggleTranslation);
-  
-  console.log('[侧边栏翻译] 按钮创建成功');
-  
-  // 记录按钮是否成功添加到文档
-  setTimeout(() => {
-    const buttonExists = document.querySelector('.translator-sidebar-button');
-    if (buttonExists) {
-      console.log('[侧边栏翻译] 按钮已成功添加到文档并可见');
-    } else {
-      console.error('[侧边栏翻译] 按钮创建失败或不可见');
-    }
-  }, 500);
-}
 
 // 切换翻译状态
 function toggleTranslation() {
@@ -897,7 +843,7 @@ function checkBackgroundService() {
 
 // 页面加载完成后初始化
 function initSidebarTranslator() {
-  console.log('[侧边栏翻译] 初始化开始');
+  console.log('[侧边栏翻译] 初始化开始（不创建悬浮圆钮）');
   
   // 确保页面完全加载
   if (document.readyState === 'loading') {
@@ -907,23 +853,9 @@ function initSidebarTranslator() {
   }
   
   function onDomReady() {
-    console.log('[侧边栏翻译] DOM已加载，创建侧边栏按钮');
-    
-    // 创建侧边栏按钮
-    createSidebarButton();
-    
     // 检查后台服务
     checkBackgroundService();
-    
-    // 确保按钮创建，即使DOM加载延迟也能创建
-    setTimeout(() => {
-      if (!document.querySelector('.translator-sidebar-button')) {
-        console.log('[侧边栏翻译] 延迟检测未找到按钮，尝试重新创建');
-        createSidebarButton();
-      }
-    }, 1000);
-    
-    console.log('[侧边栏翻译] 初始化完成');
+    console.log('[侧边栏翻译] 初始化完成，全文翻译悬浮圆钮已关闭');
   }
 }
 
@@ -934,4 +866,4 @@ if (document.readyState === 'complete' || document.readyState === 'interactive')
 } else {
   // 正常初始化流程
   initSidebarTranslator();
-} 
+}

@@ -169,9 +169,9 @@
   <div class="section">
     <div class="section-title">翻译引擎</div>
     <select id="translation-engine">
-      <option value="ollama" selected>本地大模型(Ollama)</option>
+      <option value="ollama">本地大模型(Ollama)</option>
       <option value="baidu">百度翻译</option>
-      <option value="aliyun">阿里云翻译</option>
+      <option value="aliyun" selected>阿里云翻译</option>
     </select>
   </div>
   
@@ -194,10 +194,34 @@
     <button id="refresh-models" class="button-secondary" style="margin-bottom: 10px;">刷新模型列表</button>
     <button id="test-ollama" class="button-secondary">测试连接</button>
   </div>
+
+  <!-- 阿里云凭据配置：仅保存到扩展的 storage.local，不同步到浏览器账户 -->
+  <div id="aliyun-settings" class="section" style="display: none;">
+    <div class="section-title">阿里云机器翻译配置</div>
+    <div style="margin-bottom: 10px;">
+      <input type="text" id="aliyun-access-key-id" autocomplete="off" placeholder="AccessKey ID" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+    </div>
+    <div style="margin-bottom: 10px;">
+      <input type="password" id="aliyun-access-key-secret" autocomplete="off" placeholder="AccessKey Secret" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+    </div>
+    <div style="font-size: 11px; line-height: 1.5; color: #777; margin-bottom: 10px;">
+      凭据只保存在本机扩展存储中。普通网页翻译直接调用阿里云；漫画图片翻译不读取这里的凭据，统一使用 manga-translator-ui 项目配置文件。建议使用仅允许机器翻译的 RAM 用户。
+    </div>
+    <button id="test-aliyun" class="button-secondary">测试阿里云连接</button>
+  </div>
   
   <div class="section button-container">
     <button id="save-settings" class="button-primary">保存设置</button>
     <button id="reset-settings">恢复默认设置</button>
+  </div>
+
+  <div class="section" style="border-top: 1px solid #eee; padding-top: 14px;">
+    <div class="section-title">漫画翻译</div>
+    <div style="font-size: 11px; line-height: 1.5; color: #777; margin-bottom: 8px;">
+      网页主页面可直接逐张翻译漫画；章节页支持 HTML 导入和结果下载。漫画配置可在本地与 AIGate 云端共用。
+    </div>
+    <button id="open-manga-translator" class="button-secondary">打开漫画章节翻译</button>
+    <button id="open-manga-config" class="button-secondary">漫画翻译配置</button>
   </div>
   
   <!-- 添加消息提示区域 -->

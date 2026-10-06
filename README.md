@@ -51,7 +51,21 @@
   - 简洁的弹出设置菜单
   - 动画过渡效果
   - 清晰的状态反馈
-  - 浮动翻译按钮，便于随时开启或关闭翻译功能
+  - 选中文本后在右下角显示小点，悬停或点击后请求翻译，离开选区和浮窗 500ms 后自动关闭
+
+- **Firefox / Zen 支持**：
+  - 根目录 `manifest.json` 是 Firefox/Zen 事件页版本，可直接临时加载
+  - `manifest.chrome.json` 保留 Chrome Manifest V3 版本
+
+- **漫画章节翻译**：
+  - 在支持章节图片的漫画网页右下角直接点击“翻译本章”，无需先下载 HTML
+  - 从本地章节 HTML 提取普通图片、懒加载图片和 `slides_p_path` 图片数组
+  - 逐张调用本地 `manga-translator-ui`，完成 OCR、原文擦除、翻译和排版
+  - 翻译过程中支持暂停/继续，暂停会在当前图片处理完成后生效
+  - 失败页面会单独标记，并可点击“重试失败页”只重新处理失败页面
+  - 检测到不完整缓存时，可点击“继承缓存并继续”只完成尚未缓存的页面
+  - 翻译结果生成后可用“显示原图 / 显示翻译图”按钮在当前页面切换预览
+  - 支持预览进度，并下载内嵌翻译图片的中文 HTML 章节
 
 ## 系统架构
 
@@ -64,6 +78,10 @@
   - 处理页面DOM元素识别
   - 管理翻译结果的显示
   - 处理用户交互
+
+- **漫画网页入口** (`scripts/manga-page.js`)：
+  - 从当前章节页面提取图片地址
+  - 在当前网页提供逐张翻译、原图替换和暂停/继续控制
 
 - **侧边栏翻译** (`sidebar-translator.js`)：
   - 提供页面全文翻译能力
@@ -80,35 +98,31 @@
 
 ## 安装步骤
 
+### Firefox / Zen
+
 1. 克隆或下载此仓库
-2. 在 Chrome 浏览器中打开扩展管理页面 (`chrome://extensions/`)
-3. 开启"开发者模式"
-4. 点击"加载已解压的扩展"
-5. 选择此项目文件夹
+2. 在 Zen 地址栏打开 `about:debugging#/runtime/this-firefox`
+3. 点击“此 Firefox” → “临时加载附加组件”
+4. 选择仓库根目录中的 `manifest.json`
+
+### Chrome / Chromium
+
+1. 打开 `chrome://extensions/` 并开启“开发者模式”
+2. 点击“加载已解压的扩展程序”
+3. 将 `manifest.chrome.json` 复制到一个单独的 Chrome 构建目录并重命名为 `manifest.json`
+4. 在“加载已解压的扩展程序”中选择这个构建目录（Firefox/Zen 仍直接加载根目录 `manifest.json`）
 
 ## 配置API凭据
 
-使用此扩展需要配置翻译API凭据：
+使用此扩展需要配置翻译 API 凭据：
 
 ### 在线翻译API配置
 
-1. 打开 `src/background.js` 文件
-2. 替换百度翻译API的 `APPID` 和 `SECRET` 为您自己的凭据
-3. 替换阿里云翻译API的 `ACCESS_KEY_ID` 和 `ACCESS_KEY_SECRET` 为您自己的凭据
+在扩展弹窗的“翻译引擎”中选择“阿里云翻译”，填写 AccessKey ID 和 AccessKey Secret 后保存。凭据只保存到浏览器的 `storage.local`，不会写入源码、同步到浏览器账户，也不会发送到本项目服务器。
 
-```javascript
-// 百度翻译API凭据
-const BAIDU_API_CREDENTIALS = {
-  APPID: '您的百度翻译APPID', 
-  SECRET: '您的百度翻译密钥'
-};
+建议创建只允许机器翻译接口的 RAM 用户，不要把主账号 AccessKey 写入扩展。浏览器本地存储不是服务器端密钥保管系统；如果要多人使用或发布给其他用户，应增加本地或服务端代理，让 AccessKey Secret 不进入浏览器。
 
-// 阿里云翻译API凭据
-const ALIYUN_API_CREDENTIALS = {
-  ACCESS_KEY_ID: '您的阿里云AccessKeyID',
-  ACCESS_KEY_SECRET: '您的阿里云AccessKeySecret'
-};
-```
+扩展调用阿里云机器翻译通用版 `TranslateGeneral`，单次请求最多 5000 字符。阿里云免费额度和超额计费以控制台当前规则为准。
 
 ### 本地大模型（Ollama）配置
 
@@ -148,8 +162,8 @@ const ALIYUN_API_CREDENTIALS = {
 1. 安装扩展后，在浏览器右上角会出现扩展图标
 2. 点击图标打开设置面板
 3. 选择您偏好的翻译模式（轻量/完整）
-4. 默认使用本地大模型(Ollama)进行翻译，您也可以切换到百度翻译或阿里云翻译
-5. 在网页上选中文本后，将自动显示翻译结果
+4. 默认使用阿里云翻译，也可以切换到 Ollama 或百度翻译
+5. 在网页上选中文本后，右下角会出现一个小点；悬停或点击小点后显示翻译结果，光标离开选区和浮窗 500ms 后自动关闭
 
 ### 侧边栏全文翻译功能
 
@@ -159,6 +173,22 @@ const ALIYUN_API_CREDENTIALS = {
 4. 再次点击按钮可以关闭翻译功能
 5. 系统会智能识别内容语言，只翻译非中文的内容
 6. 对于代码仓库页面（如GitHub或Gitee），系统会进行特殊优化以更好地展示README和代码注释
+
+### 漫画章节翻译功能
+
+1. 打开漫画章节网页；检测到章节图片后，右下角会出现“翻译本章”面板。点击后会在当前网页逐张读取、翻译并替换原图，不会把整章一次性导入插件页面。
+2. Firefox/Zen 用户首次使用时，先运行 `native-host/install-macos.sh`；网页面板会按所选后端准备本机桥接和翻译服务。
+3. 从扩展弹窗点击“漫画翻译配置”，或在漫画翻译页右上角打开配置页；可导入或导出 `manga-translator-ui` 完整配置，也可读取本机现有配置。首次读取本机配置后保存到扩展，即作为本地和 AIGate 共用配置。
+4. 开始翻译前，扩展会把同一份配置应用到所选后端。本地模式会更新本机 `config/config.json`；AIGate 模式只在运行中的服务进程内应用，不会将这份配置写入云端共享磁盘。
+5. 网页面板支持暂停/继续，暂停只会在当前图片处理完成后生效。
+6. 如果网页没有显示入口，也可以从扩展弹窗点击“打开漫画章节翻译”，选择本地章节 HTML 作为备用方式；示例网站的 `slides_p_path` 图片地址会自动解析为章节图片列表。
+7. 插件漫画翻译页仍可用于测试所选后端、查看图片列表和下载翻译版 HTML。
+
+漫画翻译页的“翻译后端”可选择本地或 AIGate。使用 AIGate 时填写云扉 Bearer Token，刷新资源后选择区域、GPU 规格和个人镜像；也可以选择已有实例。创建实例会先显示规格和价格并要求确认，随后启动 AIGate 实例，通过 SSH 在 `/home/waas` 下定位 `manga-translator-ui` 项目与 Python 环境，启动 `shared` API（HTTP 6006）。原图逐张上传到云端，翻译结果逐张回传并保存到本机选择的目录及章节缓存清单。AIGate Token 保存在本机扩展存储中，不会写入项目源码。停止按钮会关闭所选实例。
+
+漫画翻译使用 `manga-translator-ui` 的 App 核心 `shared` 模式，通过本机 `http://127.0.0.1:5003` 提供统一桥接服务。网页内嵌入口逐张使用 `/execute_image/translate`，插件章节页和 Qt 桌面端也共享同一个本机任务队列和翻译核心；批量桥接接口 `/execute_image/batch_translate` 保留给可持续持有流连接的客户端。网页入口不依赖长时间 `runtime.Port`，因此 Firefox/Zen 后台页重启不会中断整章任务。桥接进程由 Native Messaging 或 Qt 客户端按需启动，不启动 Web UI，也不要求 Web 登录。插件的配置页保存一份完整 JSON；本地翻译会将其写入桌面项目配置，AIGate 翻译会通过带 nonce 保护的 HTTPS 接口应用到云端进程内，并在任务开始前固定配置版本。配置内已有的第三方翻译密钥会随配置一并发送到所选云端服务。
+
+“启动 App 核心桥接”通过 Firefox/Zen Native Messaging 调用本机启动器，启动命令固定为 `python -m manga_translator shared --host 127.0.0.1 --port 5003`，只监听本机回环地址，不会启动远程服务。Native Messaging 清单安装在 macOS 用户目录的 `~/Library/Application Support/Mozilla/NativeMessagingHosts/`。
 
 ### 智能语言检测
 
@@ -232,14 +262,24 @@ SOFTWARE.
 
 ```
 translator/
-├── config/                  # 配置文件
-│   └── api-credentials.js   # API凭据配置
 ├── icons/                   # 扩展图标
 ├── popup/                   # 弹出窗口
 │   ├── popup.html           # 弹出窗口HTML
 │   └── popup.js             # 弹出窗口脚本
+├── manga/                   # 漫画章节翻译页面
+│   ├── manga.html           # HTML 章节选择与翻译进度页
+│   ├── manga.js             # 图片提取、本地后端调用与结果下载
+│   ├── manga.css            # 漫画翻译页面样式
+│   ├── config.html          # manga-translator-ui 漫画配置页
+│   ├── config.js            # 配置编辑、导入导出和本地/云端同步
+│   └── config-schema.json   # 配置分组与字段清单
+├── native-host/              # Firefox/Zen 本机后端启动器
+│   ├── manga_backend_host.py # Native Messaging 主机逻辑
+│   ├── manga_backend_host.c  # macOS/Zen 原生启动器源码
+│   └── install-macos.sh      # 编译并安装本机启动器清单
 ├── scripts/                 # 主要脚本
 │   ├── background.js        # 后台脚本
+│   ├── selection-trigger.js  # Firefox/Zen 划词小点与结果卡片
 │   ├── content.js           # 内容脚本
 │   ├── content-simple.js    # 轻量模式内容脚本
 │   ├── sidebar-translator.js # 侧边栏全文翻译功能
@@ -247,7 +287,7 @@ translator/
 │   ├── translator-module.js # 翻译模块
 │   ├── crypto.js            # 加密工具
 │   ├── crypto-util.js       # 加密辅助函数
-│   └── crypto-js.min.js     # CryptoJS库
+│   └── crypto-js.min.js     # 上游兼容资源（阿里云签名已使用浏览器原生 Web Crypto）
 ├── styles/                  # 样式文件
 │   ├── content.css          # 内容样式
 │   └── sidebar-button.css   # 侧边栏按钮样式
