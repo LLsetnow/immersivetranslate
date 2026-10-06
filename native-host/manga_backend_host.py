@@ -768,6 +768,7 @@ NONCE_FILE="$STATE_DIR/shared-api.nonce"
 PROJECT_ROOT_FILE="$STATE_DIR/shared-api.project"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
+echo 'IMT_STEP=remote-shell-started' >&2
 
 gpu_probe() {{
   "$1" - <<'PY'
@@ -811,6 +812,22 @@ print('OK:' + encoded)
 PY
 }}
 
+run_git_clone() {{
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 150s env GIT_TERMINAL_PROMPT=0 git -c http.connectTimeout=20 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+  else
+    env GIT_TERMINAL_PROMPT=0 git -c http.connectTimeout=20 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+  fi
+}}
+
+run_git_pull() {{
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 120s env GIT_TERMINAL_PROMPT=0 git -c http.connectTimeout=20 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+  else
+    env GIT_TERMINAL_PROMPT=0 git -c http.connectTimeout=20 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+  fi
+}}
+
 bootstrap_personal_checkout() {{
   local source_root="$1"
   local checkout_parent="/home/waas/.cache/immersive-translate"
@@ -819,12 +836,19 @@ bootstrap_personal_checkout() {{
 
   mkdir -p "$checkout_parent"
   if [ ! -e "$checkout_root" ]; then
+    echo 'IMT_STEP=clone-personal-repository' >&2
     temporary_root="$(mktemp -d "$checkout_parent/.manga-translator-ui.clone.XXXXXX")"
     rmdir "$temporary_root"
-    if ! git clone --quiet --depth 1 --single-branch --origin personal \
-      https://github.com/LLsetnow/manga-translator-ui.git "$temporary_root"; then
+    if run_git_clone clone --quiet --depth 1 --single-branch --origin personal https://github.com/LLsetnow/manga-translator-ui.git "$temporary_root"; then
+      :
+    else
+      clone_status="$?"
       rm -rf "$temporary_root"
-      echo 'AIGATE_ERROR=unable to clone your public LLsetnow/manga-translator-ui repository onto the instance' >&2
+      if [ "$clone_status" -eq 124 ]; then
+        echo 'AIGATE_ERROR=GitHub clone timed out after 150 seconds; check AIGate instance outbound access to github.com' >&2
+      else
+        echo 'AIGATE_ERROR=GitHub clone failed; check AIGate instance outbound access and the personal repository URL' >&2
+      fi
       return 1
     fi
     if ! mv "$temporary_root" "$checkout_root"; then
@@ -890,8 +914,16 @@ sync_project() {{
     echo 'AIGATE_ERROR=manga-translator-ui has no current Git commit' >&2
     return 1
   fi
-  if ! git -C "$root" pull --ff-only --quiet "$remote_name" "$branch_name" >/dev/null 2>&1; then
-    echo 'AIGATE_ERROR=git pull --ff-only failed for the configured personal manga-translator-ui branch; check network, branch, and divergence' >&2
+  echo 'IMT_STEP=pull-personal-repository' >&2
+  if run_git_pull -C "$root" pull --ff-only --quiet "$remote_name" "$branch_name" >/dev/null 2>&1; then
+    :
+  else
+    pull_status="$?"
+    if [ "$pull_status" -eq 124 ]; then
+      echo 'AIGATE_ERROR=git pull timed out after 120 seconds; check AIGate instance outbound access to github.com' >&2
+    else
+      echo 'AIGATE_ERROR=git pull --ff-only failed for the configured personal manga-translator-ui branch; check network, branch, and divergence' >&2
+    fi
     return 1
   fi
   after="$(git -C "$root" rev-parse --verify HEAD 2>/dev/null || true)"
@@ -937,6 +969,7 @@ if [ -z "$SERVER_PID" ] && [ -n "$LISTENER_PID" ]; then
 fi
 
 if [ -n "$SERVER_PID" ]; then
+  echo 'IMT_STEP=verify-running-service-and-gpu' >&2
   PROBE_PYTHON="$(readlink -f "/proc/$SERVER_PID/exe" 2>/dev/null || true)"
   if [ ! -x "$PROBE_PYTHON" ]; then
     PROBE_PYTHON="$(command -v python3 || true)"
@@ -1131,6 +1164,7 @@ if [ "$SERVER_RUNNING" != 1 ]; then
   fi
   PYTHON_BIN=""
   LAST_GPU_ERROR=""
+  echo 'IMT_STEP=select-python-environment' >&2
   for CANDIDATE_PYTHON in \
     /opt/manga-translator-ui-venv/bin/python \
     "$PROJECT_ROOT/.venv/bin/python" \
@@ -1141,6 +1175,7 @@ if [ "$SERVER_RUNNING" != 1 ]; then
   do
     if [ -x "$CANDIDATE_PYTHON" ] \
       && (cd "$PROJECT_ROOT" && PYTHONDONTWRITEBYTECODE=1 "$CANDIDATE_PYTHON" -c 'import manga_translator.mode.share' >/dev/null 2>&1); then
+      echo 'IMT_STEP=verify-cuda-runtime' >&2
       GPU_CHECK_RESULT="$(gpu_probe "$CANDIDATE_PYTHON" || true)"
       case "$GPU_CHECK_RESULT" in
         OK:*)
@@ -1171,6 +1206,7 @@ if [ "$SERVER_RUNNING" != 1 ]; then
     exit 26
   fi
   cd "$PROJECT_ROOT"
+  echo 'IMT_STEP=launch-translation-service' >&2
   printf '%s' "$NONCE" > "$NONCE_FILE"
   chmod 600 "$NONCE_FILE"
   printf '%s' "$PROJECT_ROOT" > "$PROJECT_ROOT_FILE"
@@ -1253,6 +1289,8 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
         ssh_args = [
             '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'ConnectTimeout=20',
+            '-o', 'ServerAliveInterval=15',
+            '-o', 'ServerAliveCountMax=3',
             '-o', 'BatchMode=yes',
             '-p', str(ssh_port),
             f'root@{ssh_host}',
@@ -1264,15 +1302,42 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
                 if probe_only else '正在同步你的 manga-translator-ui GitHub 分支，然后启动云端服务…'
             )
         env = os.environ.copy()
-        remote = subprocess.run(
-            [ssh_command, *ssh_args],
-            input=_remote_start_script(nonce, probe_only=probe_only),
-            capture_output=True,
-            text=True,
-            timeout=240,
-            env=env,
-            check=False,
-        )
+        remote_script = _remote_start_script(nonce, probe_only=probe_only)
+
+        def run_remote(command):
+            try:
+                return subprocess.run(
+                    command,
+                    input=remote_script,
+                    capture_output=True,
+                    text=True,
+                    timeout=240,
+                    env=env,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                captured = error.stderr or error.output or ''
+                if isinstance(captured, bytes):
+                    captured = captured.decode('utf-8', errors='replace')
+                stages = {
+                    'IMT_STEP=remote-shell-started': 'SSH 远端脚本已启动',
+                    'IMT_STEP=clone-personal-repository': '克隆个人 GitHub 仓库',
+                    'IMT_STEP=pull-personal-repository': '从个人 GitHub 仓库执行 git pull',
+                    'IMT_STEP=verify-running-service-and-gpu': '检查现有服务和 CUDA',
+                    'IMT_STEP=select-python-environment': '选择云端 Python 环境',
+                    'IMT_STEP=verify-cuda-runtime': '初始化并检查 CUDA',
+                    'IMT_STEP=launch-translation-service': '启动翻译服务进程',
+                }
+                completed_stages = [
+                    (position, label)
+                    for marker, label in stages.items()
+                    if (position := captured.rfind(marker)) >= 0
+                ]
+                stage = max(completed_stages, default=(-1, 'SSH 连接或远端命令无响应'))[1]
+                prefix = '检查云端翻译服务' if probe_only else '启动云端翻译服务'
+                raise RuntimeError(f'{prefix}超时（240 秒），最后阶段：{stage}') from error
+
+        remote = run_remote([ssh_command, *ssh_args])
         ssh_error = (remote.stderr or '').lower()
         authentication_unavailable = any(
             marker in ssh_error
@@ -1305,15 +1370,7 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
                 '-o', 'PreferredAuthentications=password',
                 '-o', 'PubkeyAuthentication=no',
             ]
-            remote = subprocess.run(
-                [sshpass, '-e', ssh_command, *password_args],
-                input=_remote_start_script(nonce, probe_only=probe_only),
-                capture_output=True,
-                text=True,
-                timeout=240,
-                env=env,
-                check=False,
-            )
+            remote = run_remote([sshpass, '-e', ssh_command, *password_args])
         if remote.returncode != 0:
             detail_text = (remote.stderr or remote.stdout or '').strip().splitlines()
             safe_detail = detail_text[-1][:240] if detail_text else f'SSH 退出码 {remote.returncode}'
