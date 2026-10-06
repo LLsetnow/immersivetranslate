@@ -457,7 +457,19 @@ async function getMangaTranslatorConfig() {
 }
 
 async function applyMangaTranslatorConfig(backend) {
-  const config = await getMangaTranslatorConfig();
+  const savedConfig = await getMangaTranslatorConfig();
+  // Cloud translation must not inherit a local CPU-only preference. Keep the
+  // saved config untouched so switching back to local mode preserves it.
+  const config = backend.mode === 'aigate'
+    ? JSON.parse(JSON.stringify(savedConfig))
+    : savedConfig;
+  if (backend.mode === 'aigate') {
+    config.cli = config.cli && typeof config.cli === 'object' && !Array.isArray(config.cli)
+      ? config.cli
+      : {};
+    config.cli.use_gpu = true;
+    config.cli.disable_onnx_gpu = false;
+  }
   let response;
   try {
     response = await fetch(`${backend.endpoint}/config/apply`, {

@@ -626,6 +626,19 @@
     return info;
   }
 
+  function validateAigateGpu(gpu) {
+    if (!gpu?.cudaAvailable || !gpu?.onnxCudaAvailable || !String(gpu.deviceName || '').trim()) {
+      throw new Error('云端 Python 环境未确认 PyTorch CUDA 和 ONNX Runtime CUDA 可用；翻译不会按 GPU 就绪处理');
+    }
+    return gpu;
+  }
+
+  function aigateGpuSummary(gpu) {
+    const device = String(gpu.deviceName || 'CUDA GPU').trim();
+    const cuda = String(gpu.cudaVersion || '').trim();
+    return `GPU ${device}${cuda ? ` · CUDA ${cuda}` : ''}`;
+  }
+
   async function fetchAigateBackendInfo(endpoint, nonce) {
     const serviceEndpoint = normalizeAigateEndpoint(endpoint);
     const serviceNonce = String(nonce || '').trim();
@@ -893,6 +906,7 @@
         nonce: state.aigateNonce,
       }, message => setAigateStatus(message));
       if (!result.success) throw new Error(result.error || '启动 AIGate 翻译服务失败');
+      const gpu = validateAigateGpu(result.gpu);
       serviceStarted = true;
       state.aigateInstanceId = selectedInstanceId;
       state.aigateEndpoint = normalizeAigateEndpoint(result.endpoint);
@@ -910,9 +924,16 @@
         mangaAigateEndpoint: state.aigateEndpoint,
         mangaAigateNonce: state.aigateNonce,
       });
+      const configResult = await sendRuntimeMessage({
+        action: 'applyMangaTranslatorConfig',
+        reloadLocalConfig: false,
+      });
+      if (!configResult.success || configResult.backend !== 'aigate') {
+        throw new Error(configResult.error || '云端 GPU 配置未确认应用');
+      }
       resetBackendLogCursor();
       const backendInfo = await fetchAigateBackendInfo(state.aigateEndpoint, state.aigateNonce);
-      setAigateStatus(`所选实例服务进程已运行，HTTP 6006 连通；配置 API v${backendInfo.configApiVersion} 正常`, 'success');
+      setAigateStatus(`${aigateGpuSummary(gpu)} 已就绪，PyTorch/ONNX GPU 配置已应用；HTTP 6006 与配置 API v${backendInfo.configApiVersion} 正常`, 'success');
       return true;
     } catch (error) {
       setAigateStatus(
@@ -942,25 +963,31 @@
     renderAigateResources();
     setAigateStatus('正在检查所选实例上的翻译进程和 HTTP 6006 连通性…');
     try {
-      if (!endpoint || String(nonce || '').trim().length < 24) {
-        const result = await nativeRequestWithProgress({
-          action: 'aigateCheckTranslation',
-          token: state.aigateToken,
-          instanceId: state.aigateInstanceId,
-        }, message => setAigateStatus(message));
-        if (!result.success) throw new Error(result.error || '检查云端翻译服务失败');
-        endpoint = normalizeAigateEndpoint(result.endpoint);
-        nonce = String(result.nonce || '').trim();
-        if (nonce.length < 24) throw new Error('云端服务未返回有效访问凭据');
-        state.aigateEndpoint = endpoint;
-        state.aigateNonce = nonce;
-        await storageSet({
-          mangaAigateEndpoint: endpoint,
-          mangaAigateNonce: nonce,
-        });
-      }
+      const result = await nativeRequestWithProgress({
+        action: 'aigateCheckTranslation',
+        token: state.aigateToken,
+        instanceId: state.aigateInstanceId,
+      }, message => setAigateStatus(message));
+      if (!result.success) throw new Error(result.error || '检查云端翻译服务失败');
+      const gpu = validateAigateGpu(result.gpu);
+      endpoint = normalizeAigateEndpoint(result.endpoint);
+      nonce = String(result.nonce || '').trim();
+      if (nonce.length < 24) throw new Error('云端服务未返回有效访问凭据');
+      state.aigateEndpoint = endpoint;
+      state.aigateNonce = nonce;
+      await storageSet({
+        mangaAigateEndpoint: endpoint,
+        mangaAigateNonce: nonce,
+      });
       const info = await fetchAigateBackendInfo(endpoint, nonce);
-      setAigateStatus(`云端服务连通正常 · 配置 API v${info.configApiVersion}`, 'success');
+      const configResult = await sendRuntimeMessage({
+        action: 'applyMangaTranslatorConfig',
+        reloadLocalConfig: false,
+      });
+      if (!configResult.success || configResult.backend !== 'aigate') {
+        throw new Error(configResult.error || '云端 GPU 配置未确认应用');
+      }
+      setAigateStatus(`${aigateGpuSummary(gpu)} 已就绪，GPU 配置已应用 · HTTP 6006 与配置 API v${info.configApiVersion} 正常`, 'success');
       return true;
     } catch (error) {
       setAigateStatus(`云端服务连通性检查失败：${error.message || error}`, 'error');

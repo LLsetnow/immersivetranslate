@@ -769,9 +769,52 @@ PROJECT_ROOT_FILE="$STATE_DIR/shared-api.project"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
+gpu_probe() {{
+  "$1" - <<'PY'
+import base64
+import json
+import sys
+
+try:
+    import torch
+except Exception as error:
+    print('ERROR:PyTorch 导入失败：' + type(error).__name__)
+    sys.exit(1)
+if not torch.cuda.is_available():
+    print('ERROR:当前 Python 环境的 PyTorch CUDA 不可用')
+    sys.exit(1)
+try:
+    torch.empty(1, device='cuda')
+    torch.cuda.synchronize()
+except Exception as error:
+    print('ERROR:PyTorch CUDA 设备分配失败：' + type(error).__name__)
+    sys.exit(1)
+try:
+    import onnxruntime as ort
+except Exception as error:
+    print('ERROR:ONNX Runtime 导入失败：' + type(error).__name__)
+    sys.exit(1)
+providers = ort.get_available_providers()
+if 'CUDAExecutionProvider' not in providers:
+    print('ERROR:ONNX Runtime 未提供 CUDAExecutionProvider')
+    sys.exit(1)
+info = dict(
+    cudaAvailable=True,
+    deviceName=torch.cuda.get_device_name(0),
+    torchVersion=torch.__version__,
+    cudaVersion=str(torch.version.cuda or ''),
+    onnxCudaAvailable=True,
+    onnxRuntimeVersion=ort.__version__,
+)
+encoded = base64.b64encode(json.dumps(info, ensure_ascii=False).encode('utf-8')).decode('ascii')
+print('OK:' + encoded)
+PY
+}}
+
 SERVER_RUNNING=0
 SERVER_PID=""
 METADATA_MATCH=0
+GPU_INFO_B64=""
 if [ -s "$PID_FILE" ]; then
   CANDIDATE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
   CANDIDATE_COMMAND="$(ps -p "$CANDIDATE_PID" -o args= 2>/dev/null || true)"
@@ -787,7 +830,7 @@ LISTENER_ENTRY=""
 if command -v ss >/dev/null 2>&1; then
   LISTENER_ENTRY="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:6006$/ {{print; exit}}' || true)"
 fi
-LISTENER_PID="$(printf '%s' "$LISTENER_ENTRY" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+LISTENER_PID="$(printf '%s' "$LISTENER_ENTRY" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\\1/p' | head -n 1)"
 if [ -z "$SERVER_PID" ] && [ -n "$LISTENER_PID" ]; then
   CANDIDATE_COMMAND="$(ps -p "$LISTENER_PID" -o args= 2>/dev/null || true)"
   case "$CANDIDATE_COMMAND" in
@@ -866,14 +909,79 @@ PY
       exit 21
     fi
   fi
-  NONCE="$RECOVERED_NONCE"
-  printf '%s' "$NONCE" > "$NONCE_FILE"
-  chmod 600 "$NONCE_FILE"
-  printf '%s' "$PROJECT_ROOT" > "$PROJECT_ROOT_FILE"
-  chmod 600 "$PROJECT_ROOT_FILE"
-  printf '%s' "$SERVER_PID" > "$PID_FILE"
-  SERVER_RUNNING=1
-else
+  GPU_CHECK_RESULT="$(gpu_probe "$PROBE_PYTHON" || true)"
+  case "$GPU_CHECK_RESULT" in
+    OK:*)
+      GPU_INFO_B64="${{GPU_CHECK_RESULT#OK:}}"
+      ;;
+    *)
+      GPU_ERROR="${{GPU_CHECK_RESULT#ERROR:}}"
+      if [ "$PROBE_ONLY" = 1 ]; then
+        echo "AIGATE_ERROR=existing translation service is not GPU-ready: ${{GPU_ERROR:-CUDA validation failed}}; click start to restart the idle service with a CUDA-enabled environment" >&2
+        exit 28
+      fi
+      if "$PROBE_PYTHON" - "$RECOVERED_NONCE" "$SERVER_PID" <<'PY' >/dev/null 2>&1
+import json
+import sys
+import urllib.request
+base = 'http://127.0.0.1:6006'
+with urllib.request.urlopen(base + '/backend_info', timeout=5) as response:
+    info = json.loads(response.read().decode('utf-8'))
+if info.get('service') != 'manga-translator-ui' or info.get('mode') != 'shared':
+    sys.exit(1)
+if info.get('protocol') != 'manga-translator-ui-shared-v2' or int(info.get('configApiVersion') or 0) < 1:
+    sys.exit(1)
+if int(info.get('pid') or 0) != int(sys.argv[2]):
+    sys.exit(1)
+config_request = urllib.request.Request(base + '/config')
+config_request.add_header('X-Nonce', sys.argv[1])
+with urllib.request.urlopen(config_request, timeout=5) as response:
+    if response.status != 200:
+        sys.exit(1)
+with urllib.request.urlopen(base + '/is_locked', timeout=5) as response:
+    state = json.loads(response.read().decode('utf-8'))
+if state.get('locked') or state.get('activeJob') or int(state.get('queued') or 0) > 0:
+    sys.exit(2)
+PY
+      then
+        :
+      else
+        echo "AIGATE_ERROR=existing service is not GPU-ready (${{GPU_ERROR:-CUDA validation failed}}) and is busy or could not be safely verified; wait for its jobs to finish, then click start again" >&2
+        exit 29
+      fi
+      kill -TERM "$SERVER_PID" 2>/dev/null || true
+      for ATTEMPT in $(seq 1 30); do
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+          break
+        fi
+        sleep 1
+      done
+      if kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo 'AIGATE_ERROR=GPU service restart timed out; the existing process was not force-killed' >&2
+        exit 30
+      fi
+      SERVER_PID=""
+      SERVER_RUNNING=0
+      rm -f "$PID_FILE" "$NONCE_FILE" "$PROJECT_ROOT_FILE"
+      ;;
+  esac
+  if [ -n "$SERVER_PID" ]; then
+    NONCE="$RECOVERED_NONCE"
+    printf '%s' "$NONCE" > "$NONCE_FILE"
+    chmod 600 "$NONCE_FILE"
+    printf '%s' "$PROJECT_ROOT" > "$PROJECT_ROOT_FILE"
+    chmod 600 "$PROJECT_ROOT_FILE"
+    printf '%s' "$SERVER_PID" > "$PID_FILE"
+    SERVER_RUNNING=1
+  fi
+fi
+
+if [ "$SERVER_RUNNING" != 1 ]; then
+  LISTENER_ENTRY=""
+  if command -v ss >/dev/null 2>&1; then
+    LISTENER_ENTRY="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:6006$/ {{print; exit}}' || true)"
+  fi
+  LISTENER_PID="$(printf '%s' "$LISTENER_ENTRY" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\\1/p' | head -n 1)"
   if [ -n "$LISTENER_ENTRY" ]; then
     if [ "$PROBE_ONLY" = 1 ]; then
       echo "AIGATE_ERROR=port 6006 is occupied by an unverified process (PID ${{LISTENER_PID:-unknown}})" >&2
@@ -897,6 +1005,7 @@ else
   fi
   PROJECT_ROOT="${{PROJECT_FILE%/manga_translator/__main__.py}}"
   PYTHON_BIN=""
+  LAST_GPU_ERROR=""
   for CANDIDATE_PYTHON in \
     /opt/manga-translator-ui-venv/bin/python \
     "$PROJECT_ROOT/.venv/bin/python" \
@@ -907,12 +1016,21 @@ else
   do
     if [ -x "$CANDIDATE_PYTHON" ] \
       && (cd "$PROJECT_ROOT" && PYTHONDONTWRITEBYTECODE=1 "$CANDIDATE_PYTHON" -c 'import manga_translator.mode.share' >/dev/null 2>&1); then
-      PYTHON_BIN="$CANDIDATE_PYTHON"
-      break
+      GPU_CHECK_RESULT="$(gpu_probe "$CANDIDATE_PYTHON" || true)"
+      case "$GPU_CHECK_RESULT" in
+        OK:*)
+          PYTHON_BIN="$CANDIDATE_PYTHON"
+          GPU_INFO_B64="${{GPU_CHECK_RESULT#OK:}}"
+          break
+          ;;
+        *)
+          LAST_GPU_ERROR="${{GPU_CHECK_RESULT#ERROR:}}"
+          ;;
+      esac
     fi
   done
   if [ -z "$PYTHON_BIN" ]; then
-    echo 'AIGATE_ERROR=Python environment with manga-translator-ui dependencies was not found under /home/waas' >&2
+    echo "AIGATE_ERROR=no manga-translator-ui Python environment with PyTorch CUDA and ONNX Runtime CUDA was found under /home/waas: ${{LAST_GPU_ERROR:-dependencies unavailable}}" >&2
     exit 23
   fi
   if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ':6006 '; then
@@ -939,9 +1057,10 @@ else
   printf '%s' "$!" > "$PID_FILE"
 fi
 
-PROJECT_ROOT="${{PROJECT_FILE%/manga_translator/__main__.py}}"
+PROJECT_ROOT="$(cat "$PROJECT_ROOT_FILE" 2>/dev/null || printf '%s' "${{PROJECT_FILE%/manga_translator/__main__.py}}")"
 printf 'IMT_PROJECT_B64=%s\\n' "$(printf '%s' "$PROJECT_ROOT" | base64 | tr -d '\\n')"
 printf 'IMT_NONCE_B64=%s\\n' "$(printf '%s' "$NONCE" | base64 | tr -d '\\n')"
+printf 'IMT_GPU_B64=%s\\n' "$GPU_INFO_B64"
 '''
 
 
@@ -1077,9 +1196,14 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
                 remote_values['projectRoot'] = base64.b64decode(line.split('=', 1)[1]).decode('utf-8')
             elif line.startswith('IMT_NONCE_B64='):
                 remote_values['nonce'] = base64.b64decode(line.split('=', 1)[1]).decode('utf-8')
+            elif line.startswith('IMT_GPU_B64='):
+                remote_values['gpu'] = json.loads(base64.b64decode(line.split('=', 1)[1]).decode('utf-8'))
         nonce = remote_values.get('nonce') or nonce
+        gpu = remote_values.get('gpu')
+        if not isinstance(gpu, dict) or not gpu.get('cudaAvailable') or not gpu.get('onnxCudaAvailable'):
+            raise RuntimeError('云端服务进程未通过 PyTorch CUDA 和 ONNX Runtime CUDA 检查')
         if on_progress:
-            on_progress('正在验证 AIGate HTTP 6006 服务和访问凭据…')
+            on_progress(f"CUDA GPU 已就绪（{gpu.get('deviceName') or '未知设备'}），正在验证 AIGate HTTP 6006 服务…")
 
         deadline = time.monotonic() + 90
         info = None
@@ -1111,6 +1235,7 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
                             'endpoint': base_url,
                             'nonce': nonce,
                             'projectRoot': remote_values.get('projectRoot') or info.get('projectRoot', ''),
+                            'gpu': gpu,
                         }
                     raise RuntimeError('AIGate 服务已连通，但缺少统一配置 API v1；请更新项目并重启服务进程')
                 else:
