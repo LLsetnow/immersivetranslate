@@ -8,6 +8,8 @@
   const MANGA_BATCH_WINDOW_SIZE = 10;
   const EIGHTEEN_COMIC_BODY_IMAGE_SELECTOR = '.scramble-page:not(.thewayhome) > img';
   const EIGHTEEN_COMIC_IMAGE_ATTRIBUTES = ['data-original', 'data-src', 'data-lazy-src', 'src'];
+  const MANGA18_AUTO_TRANSLATE_STORAGE_KEY = 'immersiveTranslateManga18NextChapterIntent';
+  const MANGA18_AUTO_TRANSLATE_HASH_PREFIX = '#immersive-translate-next=';
   const state = {
     running: false,
     paused: false,
@@ -63,6 +65,87 @@
 
   function is18ComicPhotoPage() {
     return is18ComicHost() && /^\/photo(?:\/|$)/i.test(location.pathname || '');
+  }
+
+  function isManga18Hostname(hostname) {
+    const normalisedHostname = String(hostname || '').toLowerCase();
+    return normalisedHostname === 'manga18.club' || normalisedHostname.endsWith('.manga18.club');
+  }
+
+  function getManga18ChapterInfo(value = location.href) {
+    try {
+      const url = new URL(value);
+      if (!isManga18Hostname(url.hostname)) return null;
+      const match = url.pathname.match(/^(\/manhwa\/[^/]+\/chapter-)(\d+)(\/?)$/i);
+      if (!match) return null;
+      const chapterNumber = Number(match[2]);
+      if (!Number.isSafeInteger(chapterNumber)) return null;
+      return {
+        url,
+        chapterPrefix: match[1],
+        chapterNumber,
+        seriesPath: match[1].replace(/chapter-$/i, '').toLowerCase(),
+        trailingSlash: match[3],
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function buildManga18NextChapterUrl(chapterInfo) {
+    if (!chapterInfo || chapterInfo.chapterNumber >= Number.MAX_SAFE_INTEGER) return null;
+    const nextUrl = new URL(chapterInfo.url.href);
+    nextUrl.pathname = `${chapterInfo.chapterPrefix}${chapterInfo.chapterNumber + 1}${chapterInfo.trailingSlash}`;
+    return nextUrl;
+  }
+
+  function extensionStorageRequest(method, ...args) {
+    return new Promise((resolve, reject) => {
+      if (typeof chrome === 'undefined' || !chrome.storage?.local) {
+        reject(new Error('扩展本地存储不可用'));
+        return;
+      }
+      chrome.storage.local[method](...args, result => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(result);
+      });
+    });
+  }
+
+  async function consumeManga18AutoTranslateIntent(chapterInfo) {
+    if (!chapterInfo) return false;
+    const tokenMatch = location.hash.match(/^#immersive-translate-next=([a-f\d]{32})$/i);
+    if (!tokenMatch) return false;
+
+    const clearIntentHash = () => {
+      try {
+        const url = new URL(location.href);
+        url.hash = '';
+        history.replaceState(history.state, '', url.href);
+      } catch {
+        // Keep the current chapter usable even if the page disallows URL cleanup.
+      }
+    };
+
+    try {
+      const stored = await extensionStorageRequest('get', MANGA18_AUTO_TRANSLATE_STORAGE_KEY);
+      const intent = stored?.[MANGA18_AUTO_TRANSLATE_STORAGE_KEY];
+      await extensionStorageRequest('remove', MANGA18_AUTO_TRANSLATE_STORAGE_KEY);
+      clearIntentHash();
+
+      const ageMs = Date.now() - Number(intent?.createdAt);
+      return ageMs >= 0
+        && ageMs <= 10 * 60 * 1000
+        && String(intent?.nonce || '') === tokenMatch[1]
+        && String(intent?.seriesPath || '').toLowerCase() === chapterInfo.seriesPath
+        && Number(intent?.chapterNumber) === chapterInfo.chapterNumber;
+    } catch {
+      clearIntentHash();
+      return false;
+    }
   }
 
   function is18ComicBodyImageUrl(value) {
@@ -445,14 +528,35 @@
 
   async function initialiseMangaPage() {
     const special18ComicPage = is18ComicPhotoPage();
+    const manga18ChapterInfo = getManga18ChapterInfo();
+    const autoTranslateNextChapter = await consumeManga18AutoTranslateIntent(manga18ChapterInfo);
     const pageHtml = document.documentElement.outerHTML;
     const specialImageData = special18ComicPage
       ? await waitFor18ComicImageData()
       : null;
     const specialImageRecords = specialImageData?.records || [];
-    const imageUrls = special18ComicPage
+    let imageUrls = special18ComicPage
       ? specialImageData?.urls || []
       : extractImageUrls(pageHtml);
+    if (manga18ChapterInfo) {
+      const deadline = Date.now() + 20000;
+      let lastSignature = '';
+      let stableChecks = 0;
+      while (Date.now() < deadline) {
+        const nextImageUrls = extractImageUrls(document.documentElement.outerHTML);
+        imageUrls = nextImageUrls;
+        if (nextImageUrls.length >= 3) {
+          const signature = nextImageUrls.join('\n');
+          stableChecks = signature === lastSignature ? stableChecks + 1 : 0;
+          lastSignature = signature;
+          if (stableChecks >= 20) break;
+        } else {
+          stableChecks = 0;
+          lastSignature = '';
+        }
+        await sleep(100);
+      }
+    }
     const hasChapterSlides = /slides_p_path\s*=\s*\[/i.test(pageHtml);
     // 18comic pages must never fall back to the site's global image list:
     // page_arr is the chapter order, while the shell also contains ads,
@@ -483,6 +587,7 @@
     });
     const sourceUrl = normaliseSourceUrl(location.href);
     state.taskId = createTaskId(sourceUrl, imageUrls);
+    const nextChapterUrl = buildManga18NextChapterUrl(manga18ChapterInfo);
 
     function markEntrySucceeded(entry, { cached = false } = {}) {
       const wasFailed = entry.failed === true;
@@ -747,6 +852,7 @@
       .metrics { min-height: 16px; margin: -4px 0 10px; color: #aab8d8; font-size: 11px; }
       .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
       .actions .retry, .actions .continue, .actions .view-toggle { grid-column: 1 / -1; }
+      .actions .next-chapter { grid-column: 1 / -1; }
       button {
         min-height: 34px; border: 1px solid rgba(255,255,255,.18); border-radius: 9px;
         padding: 7px 10px; color: #f8fbff; background: rgba(255,255,255,.08);
@@ -784,6 +890,7 @@
           <button class="retry" data-action="retry" type="button" hidden>重试失败页</button>
           <button class="continue" data-action="continue" type="button" hidden>继承缓存并继续</button>
           <button class="view-toggle" data-action="toggle-view" type="button" hidden>显示原图</button>
+          <button class="next-chapter" data-action="next-chapter" type="button" hidden>翻译下一话</button>
         </div>
       </div>
     </section>
@@ -799,6 +906,7 @@
   const retryButton = shadow.querySelector('[data-action="retry"]');
   const continueButton = shadow.querySelector('[data-action="continue"]');
   const viewToggleButton = shadow.querySelector('[data-action="toggle-view"]');
+  const nextChapterButton = shadow.querySelector('[data-action="next-chapter"]');
   const statusNode = shadow.querySelector('.status');
   const averageTimeNode = shadow.querySelector('[data-role="average-time"]');
 
@@ -1012,6 +1120,11 @@
     viewToggleButton.hidden = !hasTranslatedImages;
     viewToggleButton.disabled = state.running || !hasTranslatedImages;
     viewToggleButton.textContent = state.showingOriginal ? '显示翻译图' : '显示原图';
+    nextChapterButton.hidden = !nextChapterUrl;
+    nextChapterButton.disabled = state.running || !nextChapterUrl;
+    nextChapterButton.textContent = manga18ChapterInfo
+      ? `翻译下一话（第 ${manga18ChapterInfo.chapterNumber + 1} 话）`
+      : '翻译下一话';
     launcher.dataset.running = String(state.running);
     startButton.textContent = state.running
       ? '处理中…'
@@ -1327,12 +1440,41 @@
     }
   }
 
+  async function translateNextManga18Chapter() {
+    if (!manga18ChapterInfo || !nextChapterUrl || state.running) return;
+    nextChapterButton.disabled = true;
+    try {
+      const randomBytes = new Uint8Array(16);
+      window.crypto.getRandomValues(randomBytes);
+      const nonce = Array.from(randomBytes, byte => byte.toString(16).padStart(2, '0')).join('');
+      await extensionStorageRequest('set', {
+        [MANGA18_AUTO_TRANSLATE_STORAGE_KEY]: {
+          nonce,
+          seriesPath: manga18ChapterInfo.seriesPath,
+          chapterNumber: manga18ChapterInfo.chapterNumber + 1,
+          createdAt: Date.now(),
+        },
+      });
+      const targetUrl = new URL(nextChapterUrl.href);
+      targetUrl.hash = `${MANGA18_AUTO_TRANSLATE_HASH_PREFIX.slice(1)}${nonce}`;
+      setStatus(
+        `正在打开第 ${manga18ChapterInfo.chapterNumber + 1} 话，页面加载后会自动开始翻译…`,
+        'success',
+      );
+      location.assign(targetUrl.href);
+    } catch (error) {
+      nextChapterButton.disabled = false;
+      setStatus(`无法启动下一话自动翻译：${error.message || error}`, 'error');
+    }
+  }
+
   launcher.addEventListener('click', () => setExpanded(card.hidden));
   collapseButton.addEventListener('click', () => setExpanded(false));
   startButton.addEventListener('click', translateCurrentPage);
   retryButton.addEventListener('click', retryFailedPages);
   continueButton.addEventListener('click', continueIncompletePages);
   viewToggleButton.addEventListener('click', toggleImageView);
+  nextChapterButton.addEventListener('click', translateNextManga18Chapter);
   pauseButton.addEventListener('click', () => {
     if (!state.running) return;
     if (!state.paused) {
@@ -1350,7 +1492,18 @@
   window.addEventListener('immersive-translation-trigger-change', schedulePanelPosition);
   document.addEventListener('selectionchange', schedulePanelPosition, { passive: true });
   positionPanel(false);
-  restoreCachedResults();
+  setRunningControls();
+  if (autoTranslateNextChapter) {
+    card.hidden = false;
+    launcher.setAttribute('aria-expanded', 'true');
+    launcher.setAttribute('aria-label', '收起图片翻译');
+    launcher.title = '收起图片翻译';
+    positionPanel(true);
+    setStatus(`已进入第 ${manga18ChapterInfo.chapterNumber} 话，正在自动开始翻译…`, 'success');
+    void translateCurrentPage();
+  } else {
+    restoreCachedResults();
+  }
   }
 
   initialiseMangaPage().catch(error => {

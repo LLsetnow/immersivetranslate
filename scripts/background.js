@@ -1333,9 +1333,85 @@ chrome.runtime.onConnect.addListener(port => {
   });
 });
 
+const MANGA18_NEXT_INTENT_STORAGE_PREFIX = 'manga18NextChapterIntentForTab:';
+const MANGA18_NEXT_INTENT_TTL_MS = 10 * 60 * 1000;
+
+function getManga18ChapterRouteFromSender(sender) {
+  try {
+    const pageUrl = new URL(sender.url || sender.tab?.url || '');
+    const hostname = pageUrl.hostname.toLowerCase();
+    if (hostname !== 'manga18.club' && !hostname.endsWith('.manga18.club')) return null;
+    const match = pageUrl.pathname.match(/^(\/manhwa\/[^/]+\/chapter-)(\d+)(\/?)$/i);
+    if (!match) return null;
+    const chapterNumber = Number(match[2]);
+    if (!Number.isSafeInteger(chapterNumber)) return null;
+    return {
+      seriesPath: match[1].replace(/chapter-$/i, '').toLowerCase(),
+      chapterNumber,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // 监听消息
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('[后台脚本] 收到消息:', request.action, request.messageId || '');
+
+  if (request.action === 'armManga18NextChapterIntent') {
+    const tabId = sender.tab?.id;
+    const currentRoute = getManga18ChapterRouteFromSender(sender);
+    const seriesPath = String(request.seriesPath || '').toLowerCase();
+    const chapterNumber = Number(request.chapterNumber);
+    if (!Number.isInteger(tabId)
+      || !currentRoute
+      || currentRoute.seriesPath !== seriesPath
+      || !Number.isSafeInteger(chapterNumber)
+      || chapterNumber !== currentRoute.chapterNumber + 1) {
+      sendResponse({ success: false, error: '只支持从 manga18.club 当前章节启动下一话翻译' });
+      return false;
+    }
+
+    const key = `${MANGA18_NEXT_INTENT_STORAGE_PREFIX}${tabId}`;
+    chrome.storage.local.set({
+      [key]: { seriesPath, chapterNumber, createdAt: Date.now() },
+    }, () => {
+      const error = chrome.runtime.lastError;
+      sendResponse(error
+        ? { success: false, error: error.message }
+        : { success: true });
+    });
+    return true;
+  }
+
+  if (request.action === 'consumeManga18NextChapterIntent') {
+    const tabId = sender.tab?.id;
+    const currentRoute = getManga18ChapterRouteFromSender(sender);
+    if (!Number.isInteger(tabId) || !currentRoute) {
+      sendResponse({ success: true, autoTranslate: false });
+      return false;
+    }
+
+    const key = `${MANGA18_NEXT_INTENT_STORAGE_PREFIX}${tabId}`;
+    chrome.storage.local.get(key, stored => {
+      const intent = stored[key];
+      const createdAt = Number(intent?.createdAt);
+      const ageMs = Date.now() - createdAt;
+      const autoTranslate = ageMs >= 0
+        && ageMs <= MANGA18_NEXT_INTENT_TTL_MS
+        && String(intent?.seriesPath || '').toLowerCase() === currentRoute.seriesPath
+        && Number(intent?.chapterNumber) === currentRoute.chapterNumber
+        && currentRoute.seriesPath === String(request.seriesPath || '').toLowerCase()
+        && currentRoute.chapterNumber === Number(request.chapterNumber);
+      chrome.storage.local.remove(key, () => {
+        const error = chrome.runtime.lastError;
+        sendResponse(error
+          ? { success: false, error: error.message }
+          : { success: true, autoTranslate });
+      });
+    });
+    return true;
+  }
   
   // 侧边栏翻译按钮发送的ping请求
   if (request.action === 'ping') {
