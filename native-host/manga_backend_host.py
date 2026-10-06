@@ -811,12 +811,59 @@ print('OK:' + encoded)
 PY
 }}
 
+bootstrap_personal_checkout() {{
+  local source_root="$1"
+  local checkout_parent="/home/waas/.cache/immersive-translate"
+  local checkout_root="$checkout_parent/manga-translator-ui"
+  local temporary_root
+
+  mkdir -p "$checkout_parent"
+  if [ ! -e "$checkout_root" ]; then
+    temporary_root="$(mktemp -d "$checkout_parent/.manga-translator-ui.clone.XXXXXX")"
+    rmdir "$temporary_root"
+    if ! git clone --quiet --depth 1 --single-branch --origin personal \
+      https://github.com/LLsetnow/manga-translator-ui.git "$temporary_root"; then
+      rm -rf "$temporary_root"
+      echo 'AIGATE_ERROR=unable to clone your public LLsetnow/manga-translator-ui repository onto the instance' >&2
+      return 1
+    fi
+    if ! mv "$temporary_root" "$checkout_root"; then
+      rm -rf "$temporary_root"
+      echo 'AIGATE_ERROR=unable to install the personal manga-translator-ui checkout on the instance' >&2
+      return 1
+    fi
+    SOURCE_UPDATED=1
+  elif ! git -C "$checkout_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo 'AIGATE_ERROR=personal manga-translator-ui checkout path exists but is not a Git worktree' >&2
+    return 1
+  fi
+
+  # Keep large models and the instance-local startup config from the existing
+  # persistent source directory without copying or committing either one.
+  if [ "$source_root" != "$checkout_root" ]; then
+    if [ -d "$source_root/models" ] && [ ! -e "$checkout_root/models" ] && [ ! -L "$checkout_root/models" ]; then
+      ln -s "$source_root/models" "$checkout_root/models"
+    fi
+    if [ -f "$source_root/config/config.json" ] \
+      && [ ! -e "$checkout_root/config/config.json" ] \
+      && [ ! -L "$checkout_root/config/config.json" ]; then
+      mkdir -p "$checkout_root/config"
+      ln -s "$source_root/config/config.json" "$checkout_root/config/config.json"
+    fi
+  fi
+  printf '%s' "$checkout_root" > "$PROJECT_ROOT_FILE"
+  chmod 600 "$PROJECT_ROOT_FILE"
+  PROJECT_ROOT="$checkout_root"
+}}
+
 sync_project() {{
   local root="$1"
   local tracking_ref remote_name branch_name remote_url before after
   if ! git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    echo 'AIGATE_ERROR=manga-translator-ui source is not a Git worktree; refusing to start stale code' >&2
-    return 1
+    if ! bootstrap_personal_checkout "$root"; then
+      return 1
+    fi
+    root="$PROJECT_ROOT"
   fi
   tracking_ref="$(git -C "$root" rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
   if [ -z "$tracking_ref" ]; then
@@ -1009,6 +1056,8 @@ PY
     if ! sync_project "$PROJECT_ROOT"; then
       exit 31
     fi
+    printf '%s' "$PROJECT_ROOT" > "$PROJECT_ROOT_FILE"
+    chmod 600 "$PROJECT_ROOT_FILE"
     PULL_DONE=1
     if [ "$GPU_READY" != 1 ] || [ "$SOURCE_UPDATED" = 1 ]; then
       kill -TERM "$SERVER_PID" 2>/dev/null || true
@@ -1076,6 +1125,9 @@ if [ "$SERVER_RUNNING" != 1 ]; then
     if ! sync_project "$PROJECT_ROOT"; then
       exit 31
     fi
+    PROJECT_FILE="$PROJECT_ROOT/manga_translator/__main__.py"
+    printf '%s' "$PROJECT_ROOT" > "$PROJECT_ROOT_FILE"
+    chmod 600 "$PROJECT_ROOT_FILE"
   fi
   PYTHON_BIN=""
   LAST_GPU_ERROR=""
