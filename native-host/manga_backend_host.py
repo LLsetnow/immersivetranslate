@@ -141,7 +141,7 @@ def _prepare_personal_git_gateway(on_progress=None) -> dict:
                 '--timeout=90',
                 '--listen=127.0.0.1',
                 f'--port={local_port}',
-                f'--base-path={temporary_directory}',
+                f'--base-path={temporary_root}',
                 str(mirror_path),
             ],
             stdin=subprocess.DEVNULL,
