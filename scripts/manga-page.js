@@ -1,4 +1,4 @@
-// 在漫画网页原页面按 10 张窗口提交图片，并逐张接收、替换翻译结果。
+// 当前章节在原页面替换译图；manga18.club 的下一话可留在本页后台翻译并缓存。
 (function () {
   'use strict';
 
@@ -8,11 +8,12 @@
   const MANGA_BATCH_WINDOW_SIZE = 10;
   const EIGHTEEN_COMIC_BODY_IMAGE_SELECTOR = '.scramble-page:not(.thewayhome) > img';
   const EIGHTEEN_COMIC_IMAGE_ATTRIBUTES = ['data-original', 'data-src', 'data-lazy-src', 'src'];
-  const MANGA18_AUTO_TRANSLATE_STORAGE_KEY = 'immersiveTranslateManga18NextChapterIntent';
-  const MANGA18_AUTO_TRANSLATE_HASH_PREFIX = '#immersive-translate-next=';
   const state = {
     running: false,
     paused: false,
+    pluginBatchSize: MANGA_BATCH_WINDOW_SIZE,
+    nextChapterRunning: false,
+    cacheChecking: false,
     entries: [],
     translated: 0,
     failed: 0,
@@ -24,7 +25,19 @@
     processingPausedAt: 0,
     processingPausedMs: 0,
     averageTimer: null,
+    progressTasks: new Map(),
+    activeProgressTaskId: '',
+    progressExpanded: false,
+    selectedProgressPage: null,
   };
+
+  function applyPreparedPluginBatchSize(ready) {
+    const value = Number(ready?.pluginBatchSize);
+    state.pluginBatchSize = Number.isFinite(value)
+      ? Math.max(1, Math.min(MANGA_BATCH_WINDOW_SIZE, Math.trunc(value)))
+      : MANGA_BATCH_WINDOW_SIZE;
+    return state.pluginBatchSize;
+  }
 
   function decodeBase64Url(value) {
     try {
@@ -76,16 +89,16 @@
     try {
       const url = new URL(value);
       if (!isManga18Hostname(url.hostname)) return null;
-      const match = url.pathname.match(/^(\/manhwa\/[^/]+\/chapter-)(\d+)(\/?)$/i);
+      const match = url.pathname.match(/^(\/manhwa\/[^/]+\/)(chapter-)?(\d+)(\/?)$/i);
       if (!match) return null;
-      const chapterNumber = Number(match[2]);
+      const chapterNumber = Number(match[3]);
       if (!Number.isSafeInteger(chapterNumber)) return null;
       return {
         url,
-        chapterPrefix: match[1],
+        chapterPrefix: `${match[1]}${match[2] || ''}`,
         chapterNumber,
-        seriesPath: match[1].replace(/chapter-$/i, '').toLowerCase(),
-        trailingSlash: match[3],
+        seriesPath: match[1].toLowerCase(),
+        trailingSlash: match[4],
       };
     } catch {
       return null;
@@ -97,55 +110,6 @@
     const nextUrl = new URL(chapterInfo.url.href);
     nextUrl.pathname = `${chapterInfo.chapterPrefix}${chapterInfo.chapterNumber + 1}${chapterInfo.trailingSlash}`;
     return nextUrl;
-  }
-
-  function extensionStorageRequest(method, ...args) {
-    return new Promise((resolve, reject) => {
-      if (typeof chrome === 'undefined' || !chrome.storage?.local) {
-        reject(new Error('扩展本地存储不可用'));
-        return;
-      }
-      chrome.storage.local[method](...args, result => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        resolve(result);
-      });
-    });
-  }
-
-  async function consumeManga18AutoTranslateIntent(chapterInfo) {
-    if (!chapterInfo) return false;
-    const tokenMatch = location.hash.match(/^#immersive-translate-next=([a-f\d]{32})$/i);
-    if (!tokenMatch) return false;
-
-    const clearIntentHash = () => {
-      try {
-        const url = new URL(location.href);
-        url.hash = '';
-        history.replaceState(history.state, '', url.href);
-      } catch {
-        // Keep the current chapter usable even if the page disallows URL cleanup.
-      }
-    };
-
-    try {
-      const stored = await extensionStorageRequest('get', MANGA18_AUTO_TRANSLATE_STORAGE_KEY);
-      const intent = stored?.[MANGA18_AUTO_TRANSLATE_STORAGE_KEY];
-      await extensionStorageRequest('remove', MANGA18_AUTO_TRANSLATE_STORAGE_KEY);
-      clearIntentHash();
-
-      const ageMs = Date.now() - Number(intent?.createdAt);
-      return ageMs >= 0
-        && ageMs <= 10 * 60 * 1000
-        && String(intent?.nonce || '') === tokenMatch[1]
-        && String(intent?.seriesPath || '').toLowerCase() === chapterInfo.seriesPath
-        && Number(intent?.chapterNumber) === chapterInfo.chapterNumber;
-    } catch {
-      clearIntentHash();
-      return false;
-    }
   }
 
   function is18ComicBodyImageUrl(value) {
@@ -383,6 +347,41 @@
     return urls;
   }
 
+  function extractManga18ChapterImageUrls(htmlText, baseUrl) {
+    const slidesMatch = String(htmlText || '').match(/slides_p_path\s*=\s*\[((?:.|\n)*?)\]\s*;/i);
+    if (slidesMatch) {
+      return Array.from(slidesMatch[1].matchAll(/[\"']([A-Za-z0-9+/=_-]+)[\"']/g))
+        .map(item => decodeBase64Url(item[1]))
+        .map(value => {
+          try {
+            return new URL(value, baseUrl).href;
+          } catch {
+            return '';
+          }
+        })
+        .filter(isHttpUrl);
+    }
+
+    const parsedPage = new DOMParser().parseFromString(String(htmlText || ''), 'text/html');
+    const seen = new Set();
+    return Array.from(parsedPage.querySelectorAll('img'))
+      .flatMap(image => ['src', 'data-src', 'data-original', 'data-lazy-src']
+        .map(attribute => image.getAttribute(attribute))
+        .filter(Boolean))
+      .map(value => {
+        try {
+          return new URL(value, baseUrl).href;
+        } catch {
+          return '';
+        }
+      })
+      .filter(url => {
+        if (!isImageUrl(url) || seen.has(url)) return false;
+        seen.add(url);
+        return true;
+      });
+  }
+
   function normaliseImageCacheKey(value) {
     if (!value) return '';
     try {
@@ -529,7 +528,6 @@
   async function initialiseMangaPage() {
     const special18ComicPage = is18ComicPhotoPage();
     const manga18ChapterInfo = getManga18ChapterInfo();
-    const autoTranslateNextChapter = await consumeManga18AutoTranslateIntent(manga18ChapterInfo);
     const pageHtml = document.documentElement.outerHTML;
     const specialImageData = special18ComicPage
       ? await waitFor18ComicImageData()
@@ -601,6 +599,11 @@
       state.cacheAvailable = true;
       if (!wasCompleted) state.translated += 1;
       if (wasFailed) state.failed = Math.max(0, state.failed - 1);
+      markProgressPageSucceeded(
+        entry.progressTaskId || state.taskId,
+        Number.isInteger(entry.progressPageIndex) ? entry.progressPageIndex : state.entries.indexOf(entry),
+        cached,
+      );
       updateAverageTime();
       setStatus(`已完成 ${state.translated} / ${state.entries.length}：${entry.name}`, 'success');
     }
@@ -609,6 +612,11 @@
       entry.completed = false;
       if (!entry.failed) state.failed += 1;
       entry.failed = true;
+      markProgressPageFailed(
+        entry.progressTaskId || state.taskId,
+        Number.isInteger(entry.progressPageIndex) ? entry.progressPageIndex : state.entries.indexOf(entry),
+        error,
+      );
       updateAverageTime();
       if (entry.element?.isConnected) {
         entry.element.style.outline = '2px solid rgba(255, 100, 100, .75)';
@@ -617,14 +625,17 @@
       setStatus(`第 ${index + 1} 页失败：${error?.message || error}`, 'error');
     }
 
-    async function runMangaBatchAttempt(entries) {
+    async function runMangaBatchAttempt(entries, preserveSuccessfulRows = false) {
       return new Promise((resolve, reject) => {
         let port = null;
         let started = false;
         let finalising = false;
         let keepAliveTimer = null;
+        const task = state.progressTasks.get(state.taskId);
+        const runId = createRunId();
         const settledIndexes = new Set();
         const pendingHandlers = [];
+        beginProgressBatch(task, entries, runId, preserveSuccessfulRows);
         const entriesByIndex = new Map(entries.map(entry => [
           state.entries.indexOf(entry),
           entry,
@@ -677,9 +688,17 @@
 
         function handleMessage(message) {
           if (!message || finalising) return;
+          if ((message.taskId && message.taskId !== state.taskId)
+            || (message.runId && message.runId !== runId)) return;
           started = true;
           if (message.action === 'mangaBatchStarted') {
+            if (message.taskId !== state.taskId || message.runId !== runId) return;
+            setProgressBackend(task, message.backend, message.pageProgressVersion);
             setStatus(`已提交 ${entries.length} 张图片，等待逐张返回结果…`);
+            return;
+          }
+          if (message.action === 'mangaBatchPageProgress') {
+            applyPageProgressEvent(message);
             return;
           }
 
@@ -717,11 +736,14 @@
           }
 
           if (message.action === 'mangaBatchDone') {
+            if (message.taskId !== state.taskId || message.runId !== runId) return;
+            if (task) task.completedAt = performance.now();
             void finish();
             return;
           }
 
           if (message.action === 'mangaBatchFailed') {
+            if (message.taskId !== state.taskId || message.runId !== runId) return;
             void finish(new Error(message.error || '批量翻译失败'));
           }
         }
@@ -745,7 +767,7 @@
             })),
             sourceUrl,
             taskId: state.taskId,
-            batchSize: MANGA_BATCH_WINDOW_SIZE,
+            runId,
           });
           // Firefox/Zen can reap an otherwise quiet event page while the
           // local model is processing a batch. Keep the connected channel
@@ -765,7 +787,7 @@
       });
     }
 
-    async function translateMangaBatchThroughBackground(entries) {
+    async function translateMangaBatchThroughBackground(entries, { retry = false } = {}) {
       let pendingEntries = entries.filter(entry => entry && entry.completed !== true);
       let lastError = null;
       // A Port can disappear after a batch has already produced some images.
@@ -773,11 +795,14 @@
       // from the page. The backend also skips pages already present in cache.
       for (let attempt = 0; attempt < 3 && pendingEntries.length; attempt += 1) {
         try {
-          await runMangaBatchAttempt(pendingEntries);
+          await runMangaBatchAttempt(pendingEntries, retry || attempt > 0);
           return;
         } catch (error) {
           lastError = error;
-          if (attempt >= 2) throw error;
+          if (attempt >= 2) {
+            pendingEntries.filter(entry => entry.completed !== true).forEach(entry => markEntryFailed(entry, error));
+            throw error;
+          }
           setStatus(
             `批量回传通道中断，正在继承已完成缓存并重试剩余 ${pendingEntries.length} 页…`,
             'info',
@@ -792,7 +817,261 @@
         }
       }
       if (!pendingEntries.length) return;
+      pendingEntries.filter(entry => entry.completed !== true).forEach(entry => markEntryFailed(entry, lastError));
       throw lastError || new Error('批量翻译失败');
+    }
+
+    function runManga18DetachedBatch(entries, sourceUrl, taskId, chapterNumber, progress, preserveSuccessfulRows = false) {
+      return new Promise((resolve, reject) => {
+        let port = null;
+        let finalising = false;
+        let keepAliveTimer = null;
+        const task = state.progressTasks.get(taskId);
+        const runId = createRunId();
+        const settledIndexes = new Set();
+        const failedEntries = new Map();
+        const entriesByIndex = new Map(entries.map(entry => [entry.pageIndex, entry]));
+        beginProgressBatch(task, entries, runId, preserveSuccessfulRows);
+
+        const cleanup = () => {
+          if (keepAliveTimer !== null) {
+            window.clearInterval(keepAliveTimer);
+            keepAliveTimer = null;
+          }
+          if (!port) return;
+          try {
+            port.onMessage.removeListener(handleMessage);
+            port.onDisconnect.removeListener(handleDisconnect);
+            port.disconnect();
+          } catch {
+            // The port may already have been closed by the browser.
+          }
+          port = null;
+        };
+
+        const updateProgress = () => {
+          if (state.paused) return;
+          const successful = Array.from(progress.outcomes.values())
+            .filter(result => result === 'success').length;
+          const failed = Array.from(progress.outcomes.values())
+            .filter(result => result === 'failed').length;
+          setStatus(
+            `第 ${chapterNumber} 话：已缓存 ${successful} / ${progress.total} 张${failed ? `，${failed} 张待重试` : ''}`,
+            failed ? 'info' : 'success',
+          );
+        };
+
+        const settleEntry = (entry, success, error = '', cached = false) => {
+          if (settledIndexes.has(entry.pageIndex)) return;
+          settledIndexes.add(entry.pageIndex);
+          if (success) {
+            progress.outcomes.set(entry.pageIndex, 'success');
+            failedEntries.delete(entry.pageIndex);
+            markProgressPageSucceeded(taskId, entry.pageIndex, cached);
+          } else {
+            progress.outcomes.set(entry.pageIndex, 'failed');
+            failedEntries.set(entry.pageIndex, entry);
+            markProgressPageFailed(taskId, entry.pageIndex, error || '批量翻译失败');
+            if (error) console.warn(`[漫画翻译] 下一话第 ${entry.pageIndex + 1} 张失败:`, error);
+          }
+          updateProgress();
+        };
+
+        const finish = error => {
+          if (finalising) return;
+          finalising = true;
+          if (!error) {
+            entries.forEach(entry => {
+              if (!settledIndexes.has(entry.pageIndex)) {
+                settleEntry(entry, false, '批量处理未返回结果图片');
+              }
+            });
+          }
+          cleanup();
+          if (error) reject(error);
+          else resolve(Array.from(failedEntries.values()));
+        };
+
+        function handleMessage(message) {
+          if (!message || finalising) return;
+          if ((message.taskId && message.taskId !== taskId)
+            || (message.runId && message.runId !== runId)) return;
+          if (message.action === 'mangaBatchStarted') {
+            setProgressBackend(task, message.backend, message.pageProgressVersion);
+            if (!state.paused) setStatus(`第 ${chapterNumber} 话：已提交 ${entries.length} 张，正在翻译…`);
+            return;
+          }
+          if (message.action === 'mangaBatchPageProgress') {
+            applyPageProgressEvent(message);
+            return;
+          }
+
+          if (message.action === 'mangaBatchDone') {
+            if (task) task.completedAt = performance.now();
+            finish(null);
+            return;
+          }
+          if (message.action === 'mangaBatchFailed') {
+            finish(new Error(message.error || '下一话批量翻译失败'));
+            return;
+          }
+
+          const pageIndex = Number(message.pageIndex);
+          const entry = entriesByIndex.get(pageIndex);
+          if (!entry) return;
+          if (message.action === 'mangaBatchImage' || message.action === 'mangaBatchImageSkipped') {
+            settleEntry(entry, true, '', message.action === 'mangaBatchImageSkipped');
+            return;
+          }
+          if (message.action === 'mangaBatchImageError') {
+            settleEntry(entry, false, message.error || '批量翻译失败');
+          }
+        }
+
+        function handleDisconnect() {
+          if (!finalising) finish(new Error('下一话翻译回传通道已断开'));
+        }
+
+        try {
+          port = chrome.runtime.connect({ name: 'manga-batch' });
+          port.onMessage.addListener(handleMessage);
+          port.onDisconnect.addListener(handleDisconnect);
+          port.postMessage({
+            action: 'translateMangaBatchInPage',
+            entries: entries.map(entry => ({
+              url: entry.url,
+              filename: entry.name,
+              pageIndex: entry.pageIndex,
+            })),
+            sourceUrl,
+            taskId,
+            runId,
+          });
+          keepAliveTimer = window.setInterval(() => {
+            if (!port || finalising) return;
+            try {
+              port.postMessage({ action: 'mangaBatchKeepAlive' });
+            } catch (error) {
+              finish(error instanceof Error ? error : new Error(String(error)));
+            }
+          }, 5000);
+        } catch (error) {
+          finish(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+    }
+
+    async function translateManga18NextChapterInBackground() {
+      if (!manga18ChapterInfo || !nextChapterUrl || state.running) return;
+      const nextChapterNumber = manga18ChapterInfo.chapterNumber + 1;
+      state.running = true;
+      state.paused = false;
+      state.nextChapterRunning = true;
+      setRunningControls();
+      countNode.textContent = `第 ${nextChapterNumber} 话`;
+      setStatus(`正在读取第 ${nextChapterNumber} 话图片；当前页面会保持不变…`);
+
+      try {
+        const response = await fetch(nextChapterUrl.href, {
+          credentials: 'include',
+          cache: 'no-store',
+          redirect: 'follow',
+        });
+        if (!response.ok) throw new Error(`读取下一话页面失败（HTTP ${response.status}）`);
+
+        const resolvedUrl = response.url || nextChapterUrl.href;
+        const resolvedChapter = getManga18ChapterInfo(resolvedUrl);
+        if (!resolvedChapter
+          || resolvedChapter.seriesPath !== manga18ChapterInfo.seriesPath
+          || resolvedChapter.chapterNumber !== nextChapterNumber) {
+          throw new Error('网站没有返回预期的下一话页面');
+        }
+
+        const htmlText = await response.text();
+        const imageUrls = extractManga18ChapterImageUrls(htmlText, resolvedUrl);
+        if (imageUrls.length < 3) {
+          throw new Error(`下一话页面只找到 ${imageUrls.length} 张图片，无法确认章节图片列表`);
+        }
+
+        const sourceUrl = normaliseSourceUrl(resolvedUrl);
+        const taskId = createTaskId(sourceUrl, imageUrls);
+        const usedNames = new Set();
+        const entries = imageUrls.map((url, index) => ({
+          url,
+          name: createUniqueEntryName(url, index, usedNames),
+          pageIndex: index,
+        }));
+        const nextTask = createProgressTask(
+          taskId,
+          `下一话 第 ${nextChapterNumber} 话`,
+          entries,
+        );
+        setActiveProgressTask(taskId);
+        const progress = { total: entries.length, outcomes: new Map() };
+        countNode.textContent = `第 ${nextChapterNumber} 话 · ${entries.length} 页`;
+        setStatus(`第 ${nextChapterNumber} 话读取到 ${entries.length} 张图片，正在准备翻译…`);
+
+        const ready = await sendMessage({ action: 'prepareMangaTranslation' });
+        if (!ready.success) throw new Error(ready.error || '翻译后端启动失败');
+        const pluginBatchSize = applyPreparedPluginBatchSize(ready);
+        setProgressBackend(nextTask, ready.backend, ready.pageProgressVersion);
+        startProcessingClock();
+
+        let lastBatchError = '';
+        for (let offset = 0; offset < entries.length; offset += pluginBatchSize) {
+          while (state.paused && state.running) await sleep(120);
+          const batch = entries.slice(offset, offset + pluginBatchSize);
+          let pendingEntries = batch;
+
+          for (let attempt = 0; attempt < 3 && pendingEntries.length; attempt += 1) {
+            while (state.paused && state.running) await sleep(120);
+            if (attempt > 0) {
+              pendingEntries.forEach(entry => progress.outcomes.set(entry.pageIndex, 'pending'));
+              setStatus(`第 ${nextChapterNumber} 话：正在重试 ${pendingEntries.length} 张失败图片（${attempt + 1}/3）…`);
+              await sleep(350 * attempt);
+            }
+            try {
+              pendingEntries = await runManga18DetachedBatch(
+                pendingEntries,
+                sourceUrl,
+                taskId,
+                nextChapterNumber,
+                progress,
+                attempt > 0,
+              );
+            } catch (error) {
+              lastBatchError = error.message || String(error);
+              pendingEntries = pendingEntries.filter(entry => (
+                progress.outcomes.get(entry.pageIndex) !== 'success'
+              ));
+            }
+          }
+
+          pendingEntries.forEach(entry => progress.outcomes.set(entry.pageIndex, 'failed'));
+          pendingEntries.forEach(entry => markProgressPageFailed(taskId, entry.pageIndex, lastBatchError || '批量处理失败'));
+        }
+
+        const successful = Array.from(progress.outcomes.values())
+          .filter(result => result === 'success').length;
+        const failed = entries.length - successful;
+        if (failed) {
+          setStatus(
+            `第 ${nextChapterNumber} 话：${successful}/${entries.length} 张已缓存，${failed} 张失败${lastBatchError ? `（${lastBatchError}）` : ''}`,
+            'error',
+          );
+        } else {
+          setStatus(`第 ${nextChapterNumber} 话的 ${successful} 张图片已翻译并缓存；当前页面保持不变。`, 'success');
+        }
+      } catch (error) {
+        setStatus(`翻译下一话失败：${error.message || error}`, 'error');
+      } finally {
+        stopProcessingClock();
+        state.running = false;
+        state.paused = false;
+        state.nextChapterRunning = false;
+        setRunningControls();
+        syncSavedBackendBadge();
+      }
     }
 
   const host = document.createElement('div');
@@ -817,10 +1096,11 @@
         color: #10182b; background: #8aa8ff;
         opacity: .5;
         box-shadow: 0 7px 18px rgba(6, 12, 26, .32), 0 0 0 4px rgba(138, 168, 255, .14);
-        cursor: pointer; pointer-events: auto;
+        cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; pointer-events: auto;
         font: 700 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         transition: background .18s ease, box-shadow .18s ease, opacity .18s ease;
       }
+      .launcher[data-dragging="true"] { cursor: grabbing; opacity: .9; }
       .launcher:hover { background: #b7c8ff; box-shadow: 0 9px 22px rgba(6, 12, 26, .38), 0 0 0 5px rgba(138, 168, 255, .2); }
       .launcher:focus-visible { outline: 3px solid rgba(183, 200, 255, .85); outline-offset: 4px; }
       .launcher[data-running="true"] { background: #72d6b0; box-shadow: 0 8px 22px rgba(6, 12, 26, .32), 0 0 0 5px rgba(114, 214, 176, .16); }
@@ -831,9 +1111,10 @@
       .card {
         position: absolute;
         right: 0;
+        display: flex; flex-direction: column; gap: 0;
         width: min(310px, calc(100vw - 32px));
-        max-height: min(360px, calc(100vh - 32px));
-        overflow: auto;
+        max-height: min(560px, calc(100vh - 32px));
+        overflow: hidden;
         padding: 13px 14px;
         border: 1px solid rgba(255,255,255,.22); border-radius: 15px;
         color: #f8fbff; background: rgba(24, 30, 47, .96);
@@ -841,16 +1122,50 @@
         backdrop-filter: blur(14px);
         pointer-events: auto;
       }
+      .card[data-details-expanded="true"] { width: min(360px, calc(100vw - 24px)); }
       .card[hidden] { display: none; }
       .card[aria-busy="true"] { cursor: progress; }
-      .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 auto; }
+      .title-cluster { display: flex; min-width: 0; align-items: baseline; gap: 8px; }
       .title { min-width: 0; overflow: hidden; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+      .backend { flex: 0 0 auto; color: #aab8d8; font-size: 11px; white-space: nowrap; }
       .count { flex: 0 0 auto; color: #aab8d8; font-size: 12px; white-space: nowrap; }
-      .status { min-height: 18px; max-height: 38px; margin: 10px 0 12px; overflow: auto; color: #b7c4df; font-size: 12px; }
+      .status { min-height: 18px; max-height: 38px; margin: 7px 0 8px; overflow: auto; color: #b7c4df; font-size: 12px; flex: 0 0 auto; }
       .status[data-kind="success"] { color: #72d6b0; }
       .status[data-kind="error"] { color: #ff9d9d; }
-      .metrics { min-height: 16px; margin: -4px 0 10px; color: #aab8d8; font-size: 11px; }
-      .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .chapter-progress { margin: 0 0 8px; flex: 0 0 auto; color: #d4def2; font-size: 11px; }
+      .chapter-summary { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+      .chapter-success { color: #72d6b0; }
+      .chapter-fail { color: #ff9d9d; }
+      .chapter-track { display: flex; width: 100%; height: 5px; overflow: hidden; border-radius: 99px; background: rgba(255,255,255,.12); }
+      .chapter-track-success { height: 100%; background: #72d6b0; transition: width .18s ease; }
+      .chapter-track-fail { height: 100%; background: #ff7777; transition: width .18s ease; }
+      .batch-summary { margin: 0 0 7px; color: #b7c4df; font-size: 11px; flex: 0 0 auto; }
+      .batch-summary[hidden], .chapter-progress[hidden], .batch-details[hidden] { display: none; }
+      .batch-activity { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 2px; }
+      .batch-detail-toggle { min-height: 22px; border: 0; padding: 1px 3px; color: #aab8d8; background: transparent; font-size: 10px; white-space: nowrap; }
+      .batch-detail-toggle:hover:not(:disabled) { transform: none; color: #fff; background: transparent; }
+      .batch-details { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; max-height: 260px; margin: 0 0 7px; overflow: hidden; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; }
+      .progress-table-wrap { min-height: 0; max-height: 194px; overflow: auto; scrollbar-width: thin; }
+      .progress-table { width: 100%; border-collapse: collapse; table-layout: fixed; color: #dce5f7; font-size: 10px; }
+      .progress-table th, .progress-table td { padding: 4px 2px; border-bottom: 1px solid rgba(255,255,255,.08); text-align: center; white-space: nowrap; }
+      .progress-table th { position: sticky; top: 0; z-index: 1; color: #aab8d8; background: #20283c; font-weight: 600; }
+      .progress-table th:first-child, .progress-table td:first-child { width: 42px; text-align: left; padding-left: 6px; }
+      .progress-table tr[data-selected="true"] { background: rgba(138,168,255,.17); }
+      .progress-row { cursor: pointer; }
+      .progress-state[data-state="done"] { color: #72d6b0; }
+      .progress-state[data-state="running"] { color: #8aa8ff; }
+      .progress-state[data-state="error"] { color: #ff9d9d; }
+      .progress-state[data-state="skipped"] { color: #aab8d8; }
+      .progress-state[data-state="waiting"] { color: #75829e; }
+      .progress-spinner { display: inline-block; animation: manga-progress-spin .9s linear infinite; }
+      @keyframes manga-progress-spin { to { transform: rotate(360deg); } }
+      .progress-selection { flex: 0 0 auto; min-height: 34px; max-height: 60px; overflow: auto; padding: 6px 8px; color: #b7c4df; background: rgba(5,10,20,.2); font-size: 10px; line-height: 1.4; }
+      .progress-selection[data-kind="error"] { color: #ff9d9d; }
+      .progress-selection[data-kind="success"] { color: #72d6b0; }
+      .progress-compat { flex: 0 0 auto; padding: 4px 7px; color: #f3d58a; background: rgba(243,213,138,.08); font-size: 10px; }
+      .metrics { min-height: 16px; margin: 0 0 8px; color: #aab8d8; font-size: 11px; flex: 0 0 auto; }
+      .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; flex: 0 0 auto; }
       .actions .retry, .actions .continue, .actions .view-toggle { grid-column: 1 / -1; }
       .actions .next-chapter { grid-column: 1 / -1; }
       button {
@@ -869,7 +1184,12 @@
       }
       .collapse:hover:not(:disabled) { color: #fff; background: rgba(255,255,255,.09); }
       @media (max-width: 420px) {
-        .card { width: min(290px, calc(100vw - 24px)); }
+        .card { width: min(310px, calc(100vw - 24px)); }
+      }
+      @media (max-height: 460px) {
+        .batch-details { max-height: 140px; }
+        .progress-table-wrap { max-height: 95px; }
+        .status { max-height: 25px; }
       }
     </style>
     <section class="panel" data-dock="right" data-placement="above" aria-label="图片翻译">
@@ -878,11 +1198,24 @@
       </button>
       <div class="card" hidden>
         <div class="card-head">
-          <span class="title">图片翻译</span>
+          <span class="title-cluster"><span class="title">图片翻译</span><span class="backend" data-role="backend">本地</span></span>
           <span class="count">${state.entries.length} 页</span>
           <button class="collapse" data-action="close" type="button" aria-label="收起图片翻译" title="收起">×</button>
         </div>
         <div class="status" data-kind="info">点击开始翻译当前章节图片</div>
+        <div class="chapter-progress" data-role="chapter-progress" hidden>
+          <div class="chapter-summary"><span data-role="chapter-label">本章：0 / 0</span><span><span class="chapter-success" data-role="chapter-success">成功 0</span> · <span class="chapter-fail" data-role="chapter-fail">失败 0</span></span></div>
+          <div class="chapter-track" aria-label="章节处理进度"><span class="chapter-track-success" data-role="progress-success-bar"></span><span class="chapter-track-fail" data-role="progress-fail-bar"></span></div>
+        </div>
+        <div class="batch-summary" data-role="batch-summary" hidden>
+          <div data-role="batch-label">当前批次：--</div>
+          <div class="batch-activity"><span data-role="batch-activity">翻译中：0 张 · 修复中：0 张</span><button class="batch-detail-toggle" data-action="toggle-details" type="button" aria-expanded="false">▸ 批次详情</button></div>
+        </div>
+        <div class="batch-details" data-role="batch-details" hidden>
+          <div class="progress-compat" data-role="progress-compat" hidden>处理中，后端未提供阶段进度</div>
+          <div class="progress-table-wrap"><table class="progress-table"><thead><tr><th>页码</th><th>准备</th><th>识别</th><th>翻译</th><th>修复</th><th>合成</th><th>结果</th></tr></thead><tbody data-role="progress-rows"></tbody></table></div>
+          <div class="progress-selection" data-role="progress-selection">选择一页查看具体步骤。</div>
+        </div>
         <div class="metrics" data-role="metrics"><span data-role="average-time">平均每张图：--</span></div>
         <div class="actions">
           <button class="primary" data-action="start" type="button">翻译本章</button>
@@ -907,13 +1240,421 @@
   const continueButton = shadow.querySelector('[data-action="continue"]');
   const viewToggleButton = shadow.querySelector('[data-action="toggle-view"]');
   const nextChapterButton = shadow.querySelector('[data-action="next-chapter"]');
+  const countNode = shadow.querySelector('.count');
   const statusNode = shadow.querySelector('.status');
   const averageTimeNode = shadow.querySelector('[data-role="average-time"]');
+  const backendNode = shadow.querySelector('[data-role="backend"]');
+  const chapterProgressNode = shadow.querySelector('[data-role="chapter-progress"]');
+  const chapterLabelNode = shadow.querySelector('[data-role="chapter-label"]');
+  const chapterSuccessNode = shadow.querySelector('[data-role="chapter-success"]');
+  const chapterFailNode = shadow.querySelector('[data-role="chapter-fail"]');
+  const progressSuccessBar = shadow.querySelector('[data-role="progress-success-bar"]');
+  const progressFailBar = shadow.querySelector('[data-role="progress-fail-bar"]');
+  const batchSummaryNode = shadow.querySelector('[data-role="batch-summary"]');
+  const batchLabelNode = shadow.querySelector('[data-role="batch-label"]');
+  const batchActivityNode = shadow.querySelector('[data-role="batch-activity"]');
+  const batchDetailsNode = shadow.querySelector('[data-role="batch-details"]');
+  const progressRowsNode = shadow.querySelector('[data-role="progress-rows"]');
+  const progressSelectionNode = shadow.querySelector('[data-role="progress-selection"]');
+  const progressCompatNode = shadow.querySelector('[data-role="progress-compat"]');
+  const detailToggleButton = shadow.querySelector('[data-action="toggle-details"]');
+
+  const PROGRESS_STAGES = ['prepare', 'recognize', 'translate', 'inpaint', 'render', 'result'];
+  const PROGRESS_STAGE_LABELS = {
+    prepare: '准备', recognize: '识别', translate: '翻译', inpaint: '修复', render: '合成', result: '结果',
+  };
+  const PIPELINE_STAGES = ['recognize', 'translate', 'inpaint', 'render'];
+
+  function emptyStageProgress() {
+    return { state: 'waiting', step: '', startedAt: 0, elapsedMs: 0, updatedAt: 0, error: '' };
+  }
+
+  function createProgressTask(taskId, chapterLabel, entries, backend = '', pageProgressVersion = 0) {
+    const pages = new Map();
+    entries.forEach((entry, index) => {
+      const pageIndex = Number.isInteger(entry.pageIndex) ? entry.pageIndex : index;
+      pages.set(pageIndex, {
+        pageIndex,
+        filename: entry.name || entry.filename || `page-${pageIndex + 1}`,
+        outcome: 'pending',
+        stages: Object.fromEntries(PROGRESS_STAGES.map(stage => [stage, emptyStageProgress()])),
+      });
+      entry.progressTaskId = taskId;
+      entry.progressPageIndex = pageIndex;
+    });
+    const task = {
+      taskId,
+      chapterLabel,
+      backend,
+      pageProgressVersion: Number(pageProgressVersion) || 0,
+      pages,
+      total: pages.size,
+      batchPageIndices: [],
+      activeRunPageIndices: [],
+      currentRunId: '',
+      lastSequence: 0,
+      startedAt: 0,
+      completedAt: 0,
+    };
+    state.progressTasks.set(taskId, task);
+    return task;
+  }
+
+  function getActiveProgressTask() {
+    return state.progressTasks.get(state.activeProgressTaskId) || null;
+  }
+
+  function setActiveProgressTask(taskId) {
+    if (!state.progressTasks.has(taskId)) return;
+    state.activeProgressTaskId = taskId;
+    state.selectedProgressPage = null;
+    updateProgressView();
+  }
+
+  function formatBackendLabel(mode) {
+    return mode === 'aigate' ? '云端' : '本地';
+  }
+
+  function updateBackendBadge(mode) {
+    backendNode.textContent = formatBackendLabel(mode);
+    backendNode.title = mode === 'aigate' ? '当前批次使用云端翻译后端' : '当前批次使用本地翻译后端';
+  }
+
+  function syncSavedBackendBadge() {
+    try {
+      chrome.storage.local.get(['mangaBackendMode'], settings => {
+        if (chrome.runtime.lastError || state.running) return;
+        updateBackendBadge(settings?.mangaBackendMode === 'aigate' ? 'aigate' : 'local');
+      });
+    } catch (_) {
+      updateBackendBadge('local');
+    }
+  }
+
+  function createRunId() {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+    return `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  }
+
+  function setProgressBackend(task, mode, version) {
+    if (!task) return;
+    task.backend = mode === 'aigate' ? 'aigate' : 'local';
+    task.pageProgressVersion = Number(version) || 0;
+    updateBackendBadge(task.backend);
+    const unreported = task.pageProgressVersion < 1;
+    task.activeRunPageIndices.forEach(pageIndex => {
+      const page = task.pages.get(pageIndex);
+      if (!page || page.outcome === 'success') return;
+      PIPELINE_STAGES.forEach(stageName => {
+        const stage = page.stages[stageName];
+        if (unreported && ['waiting', 'unavailable'].includes(stage.state)) {
+          stage.state = 'unavailable';
+          stage.step = 'backend-no-progress';
+        } else if (!unreported && stage.state === 'unavailable') {
+          page.stages[stageName] = emptyStageProgress();
+        }
+      });
+    });
+    updateProgressView();
+  }
+
+  function beginProgressBatch(task, entries, runId, preserveSuccessfulRows = false) {
+    if (!task) return;
+    task.currentRunId = runId;
+    task.lastSequence = 0;
+    if (!task.startedAt) task.startedAt = performance.now();
+    task.completedAt = 0;
+    const activeRunPageIndices = entries
+      .map(entry => Number.isInteger(entry.progressPageIndex) ? entry.progressPageIndex : entry.pageIndex)
+      .filter(Number.isInteger)
+      .sort((left, right) => left - right);
+    const retainedSuccesses = preserveSuccessfulRows
+      ? task.batchPageIndices.filter(pageIndex => task.pages.get(pageIndex)?.outcome === 'success')
+      : [];
+    task.activeRunPageIndices = activeRunPageIndices;
+    task.batchPageIndices = Array.from(new Set([...retainedSuccesses, ...activeRunPageIndices]))
+      .sort((left, right) => left - right);
+    activeRunPageIndices.forEach(pageIndex => {
+      const page = task.pages.get(pageIndex);
+      if (!page || page.outcome === 'success') return;
+      page.outcome = 'pending';
+      page.stages = Object.fromEntries(PROGRESS_STAGES.map(stageName => [stageName, emptyStageProgress()]));
+      if (task.pageProgressVersion < 1) {
+        PIPELINE_STAGES.forEach(stageName => {
+          page.stages[stageName].state = 'unavailable';
+          page.stages[stageName].step = 'backend-no-progress';
+        });
+      }
+    });
+    setActiveProgressTask(task.taskId);
+    updateProgressView();
+  }
+
+  function applyPageProgressEvent(message) {
+    const task = state.progressTasks.get(String(message.taskId || ''));
+    const pageIndex = Number(message.pageIndex);
+    const sequence = Number(message.sequence);
+    if (!task || task.currentRunId !== String(message.runId || '')
+      || !task.activeRunPageIndices.includes(pageIndex)
+      || !Number.isInteger(sequence) || sequence <= task.lastSequence) return;
+    task.lastSequence = sequence;
+    const page = task.pages.get(pageIndex);
+    const stage = page?.stages?.[message.stage];
+    if (!page || !stage || page.outcome !== 'pending') return;
+    const now = performance.now();
+    const nextState = ['waiting', 'running', 'done', 'skipped', 'error'].includes(message.state)
+      ? message.state
+      : 'waiting';
+    if (stage.state === 'running' && nextState !== 'running' && stage.startedAt) {
+      stage.elapsedMs += Math.max(0, now - stage.startedAt);
+      stage.startedAt = 0;
+    }
+    if (nextState === 'running' && stage.state !== 'running') stage.startedAt = now;
+    if (nextState === 'running' && stage.state === 'running' && !stage.startedAt) stage.startedAt = now;
+    stage.state = nextState;
+    stage.step = String(message.step || '');
+    stage.error = String(message.error || '');
+    stage.updatedAt = now;
+    if (message.state === 'error') page.lastError = stage.error || stage.step;
+    updateProgressView();
+  }
+
+  function markProgressPageSucceeded(taskId, pageIndex, cached = false) {
+    const task = state.progressTasks.get(String(taskId || ''));
+    const page = task?.pages.get(Number(pageIndex));
+    if (!task || !page) return;
+    if (cached) {
+      ['prepare', ...PIPELINE_STAGES].forEach(stageName => {
+        page.stages[stageName] = { ...emptyStageProgress(), state: 'skipped', step: 'cache' };
+      });
+    }
+    const result = page.stages.result;
+    if (result.state === 'running' && result.startedAt) {
+      result.elapsedMs += Math.max(0, performance.now() - result.startedAt);
+    }
+    result.state = 'done';
+    result.step = cached ? 'cache-complete' : 'applied';
+    result.startedAt = 0;
+    result.updatedAt = performance.now();
+    result.error = '';
+    page.outcome = 'success';
+    page.lastError = '';
+    updateProgressView();
+  }
+
+  function markProgressPageFailed(taskId, pageIndex, error) {
+    const task = state.progressTasks.get(String(taskId || ''));
+    const page = task?.pages.get(Number(pageIndex));
+    if (!task || !page || page.outcome === 'success') return;
+    page.outcome = 'failed';
+    page.lastError = String(error?.message || error || '翻译失败');
+    PROGRESS_STAGES.forEach(stageName => {
+      const stage = page.stages[stageName];
+      if (stage.state !== 'running') return;
+      if (stage.startedAt) stage.elapsedMs += Math.max(0, performance.now() - stage.startedAt);
+      stage.startedAt = 0;
+      stage.state = 'error';
+      stage.error = stage.error || page.lastError;
+    });
+    const hasStageError = PROGRESS_STAGES.some(stageName => page.stages[stageName].state === 'error');
+    if (!hasStageError) {
+      page.stages.result.state = 'error';
+      page.stages.result.step = 'failed';
+      page.stages.result.error = page.lastError;
+      page.stages.result.updatedAt = performance.now();
+    }
+    updateProgressView();
+  }
+
+  function progressStepLabel(stageName, step) {
+    const labels = {
+      download: '正在下载原图', submit: '准备提交', submitting: '正在提交翻译', received: '已提交后端',
+      loading: '正在载入图片', preprocessing: '正在预处理', colorizing: '正在图像上色', upscaling: '正在超分处理',
+      detection: '正在检测文字', ocr: '正在 OCR 识别', textline_merge: '正在整理文字区域',
+      queued: '等待阶段处理', translating: '正在翻译', translated: '翻译完成',
+      'mask-generation': '正在生成蒙版', 'mask-generation-redo': '蒙版生成重做中',
+      inpainting: '正在背景修复', 'inpainting-redo': '背景修复重做中', 'redo-complete': '修复重做完成', complete: '修复完成',
+      rendering: '正在合成文字', passthrough: '无文字图片，保留原图', saved: '合成结果已保存',
+      'save-result': '正在保存合成结果',
+      delivering: '翻译结果正在返回', 'local-save': '云端结果正在保存到本地',
+      'apply-to-page': '正在应用到网页', 'cache-restore': '正在恢复缓存结果',
+      cache: '缓存命中，跳过模型处理', 'cache-complete': '缓存结果已应用', applied: '结果已应用到网页',
+      'no-text': '未检测到文字，跳过翻译与修复', 'recognition-failed': '识别失败，跳过后续阶段',
+      'translation-failed': '翻译失败，跳过后续阶段', 'backend-no-progress': '后端未提供阶段进度',
+      'backend-result': '后端返回失败', 'empty-result': '后端未返回结果图片', 'stream-result': '准备结果失败', failed: '图片处理失败',
+    };
+    return labels[step] || (step ? String(step).replaceAll('-', ' ') : '等待处理');
+  }
+
+  function progressStepForState(stageName, stage) {
+    const label = progressStepLabel(stageName, stage?.step);
+    if (stage?.state === 'done' && label.startsWith('正在')) return `已完成${label.slice(2)}`;
+    if (stage?.state === 'skipped' && stage?.step !== 'no-text' && stage?.step !== 'cache') return `已跳过：${label}`;
+    return label;
+  }
+
+  function getProgressStatePresentation(stageName, stage) {
+    const stateName = stage?.state || 'waiting';
+    const presentation = {
+      done: ['✓', '完成'], running: ['↻', '进行中'], waiting: ['○', '等待'],
+      skipped: ['—', stage?.step === 'no-text' ? '无文字，跳过' : '跳过'],
+      unavailable: ['—', '后端未提供阶段进度'], error: ['×', '失败'],
+    }[stateName] || ['○', '等待'];
+    const detail = stage?.error || progressStepForState(stageName, stage);
+    return { symbol: presentation[0], label: presentation[1], detail, stateName };
+  }
+
+  function renderProgressTable(task) {
+    const indexes = task.batchPageIndices.slice(0, MANGA_BATCH_WINDOW_SIZE);
+    const focusedRow = shadow.activeElement?.closest?.('.progress-row');
+    const focusedPage = Number(focusedRow?.dataset.pageIndex);
+    progressRowsNode.replaceChildren();
+    const preferredPage = state.selectedProgressPage?.taskId === task.taskId
+      ? Number(state.selectedProgressPage.pageIndex)
+      : Number(state.selectedProgressPage?.pageIndex);
+    const selectedKey = indexes.includes(preferredPage) ? preferredPage : indexes[0];
+    if (indexes.length) {
+      state.selectedProgressPage = { taskId: task.taskId, pageIndex: indexes[0] };
+      if (indexes.includes(preferredPage)) {
+        state.selectedProgressPage = { taskId: task.taskId, pageIndex: preferredPage };
+      }
+    }
+    indexes.forEach(pageIndex => {
+      const page = task.pages.get(pageIndex);
+      if (!page) return;
+      const row = document.createElement('tr');
+      row.className = 'progress-row';
+      row.tabIndex = 0;
+      row.setAttribute('role', 'button');
+      row.dataset.pageIndex = String(pageIndex);
+      row.dataset.selected = String(pageIndex === selectedKey);
+      const pageCell = document.createElement('td');
+      pageCell.textContent = `第 ${pageIndex + 1} 页`;
+      row.appendChild(pageCell);
+      PROGRESS_STAGES.forEach(stageName => {
+        const cell = document.createElement('td');
+        const stage = page.stages[stageName];
+        const stateInfo = getProgressStatePresentation(stageName, stage);
+        const icon = document.createElement('span');
+        icon.className = `progress-state${stateInfo.stateName === 'running' ? ' progress-spinner' : ''}`;
+        icon.dataset.state = stateInfo.stateName === 'unavailable' ? 'skipped' : stateInfo.stateName;
+        icon.textContent = stateInfo.symbol;
+        icon.title = `${PROGRESS_STAGE_LABELS[stageName]}：${stateInfo.detail}`;
+        cell.appendChild(icon);
+        row.appendChild(cell);
+      });
+      progressRowsNode.appendChild(row);
+    });
+    if (Number.isInteger(focusedPage) && indexes.includes(focusedPage)) {
+      try {
+        progressRowsNode.querySelector(`[data-page-index="${focusedPage}"]`)?.focus({ preventScroll: true });
+      } catch (_) {
+        // Focus restoration is only for keeping keyboard selection stable during live updates.
+      }
+    }
+
+    const selectedPage = task.pages.get(selectedKey);
+    progressSelectionNode.dataset.kind = selectedPage?.outcome === 'failed' ? 'error'
+      : (selectedPage?.outcome === 'success' ? 'success' : 'info');
+    if (!selectedPage) {
+      progressSelectionNode.textContent = '选择一页查看具体步骤。';
+      return;
+    }
+    const running = PROGRESS_STAGES.find(stageName => selectedPage.stages[stageName].state === 'running');
+    const failed = PROGRESS_STAGES.find(stageName => selectedPage.stages[stageName].state === 'error');
+    const stageName = running || failed || [...PROGRESS_STAGES].reverse().find(name => selectedPage.stages[name].state === 'done' || selectedPage.stages[name].state === 'skipped');
+    if (stageName) {
+      const stage = selectedPage.stages[stageName];
+      const elapsed = stage.elapsedMs + (stage.state === 'running' && stage.startedAt ? performance.now() - stage.startedAt : 0);
+      const elapsedText = stage.state === 'running' || elapsed > 0 ? ` · 耗时 ${formatDuration(elapsed)}` : '';
+      const statusText = stage.error
+        ? `${progressStepForState(stageName, stage)}：${stage.error}`
+        : progressStepForState(stageName, stage);
+      progressSelectionNode.textContent = `${task.chapterLabel} · 第 ${selectedKey + 1} 页：${PROGRESS_STAGE_LABELS[stageName]} · ${statusText}${elapsedText}`;
+    } else if (task.pageProgressVersion < 1 && selectedPage.outcome === 'pending') {
+      progressSelectionNode.textContent = `${task.chapterLabel} · 第 ${selectedKey + 1} 页：处理中，后端未提供阶段进度。`;
+    } else {
+      progressSelectionNode.textContent = `${task.chapterLabel} · 第 ${selectedKey + 1} 页：${selectedPage.outcome === 'success' ? '处理完成' : '等待处理'}`;
+    }
+    if (selectedPage.stages.translate.step === 'no-text' || selectedPage.stages.inpaint.step === 'no-text') {
+      progressSelectionNode.textContent += '；未检测到文字，已跳过翻译与修复。';
+    }
+    if (selectedPage.outcome === 'failed' && selectedPage.lastError && !failed) {
+      progressSelectionNode.textContent += `：${selectedPage.lastError}`;
+    }
+  }
+
+  function updateProgressView() {
+    const task = getActiveProgressTask();
+    if (!task) {
+      chapterProgressNode.hidden = true;
+      batchSummaryNode.hidden = true;
+      batchDetailsNode.hidden = true;
+      if (!card.hidden) schedulePanelPosition();
+      return;
+    }
+    chapterProgressNode.hidden = task.total <= 0;
+    const pages = Array.from(task.pages.values());
+    const succeeded = pages.filter(page => page.outcome === 'success').length;
+    const failed = pages.filter(page => page.outcome === 'failed').length;
+    const processed = succeeded + failed;
+    chapterLabelNode.textContent = `${task.chapterLabel}：${processed} / ${task.total} · 失败 ${failed}`;
+    chapterSuccessNode.textContent = `成功 ${succeeded}`;
+    chapterFailNode.textContent = `失败 ${failed}`;
+    const denominator = task.total || 1;
+    progressSuccessBar.style.width = `${(succeeded / denominator) * 100}%`;
+    progressFailBar.style.width = `${(failed / denominator) * 100}%`;
+    countNode.textContent = `${task.chapterLabel} · ${task.total} 页`;
+
+    const batchPages = task.batchPageIndices.map(index => task.pages.get(index)).filter(Boolean);
+    batchSummaryNode.hidden = batchPages.length === 0;
+    if (!batchPages.length) {
+      batchDetailsNode.hidden = true;
+      return;
+    }
+    const first = batchPages[0].pageIndex + 1;
+    const last = batchPages[batchPages.length - 1].pageIndex + 1;
+    const finished = batchPages.filter(page => page.outcome !== 'pending').length;
+    batchLabelNode.textContent = `${task.chapterLabel} 当前批次：${first === last ? `第 ${first} 页` : `第 ${first}–${last} 页`} · ${finished} / ${batchPages.length} 已完成`;
+    const translateRunning = batchPages.filter(page => page.stages.translate.state === 'running').length;
+    const inpaintRunning = batchPages.filter(page => page.stages.inpaint.state === 'running').length;
+    batchActivityNode.textContent = `翻译中：${translateRunning} 张 · 修复中：${inpaintRunning} 张`;
+    const expanded = Boolean(state.progressExpanded);
+    batchDetailsNode.hidden = !expanded;
+    card.dataset.detailsExpanded = String(expanded);
+    detailToggleButton.setAttribute('aria-expanded', String(expanded));
+    detailToggleButton.textContent = expanded ? '▾ 收起详情' : '▸ 批次详情';
+    progressCompatNode.hidden = task.pageProgressVersion >= 1;
+    if (expanded) renderProgressTable(task);
+    if (!card.hidden) schedulePanelPosition();
+  }
+
+  function setProgressDetailsExpanded(expanded) {
+    state.progressExpanded = Boolean(expanded);
+    updateProgressView();
+    positionPanel(true);
+  }
+
+  const currentChapterLabel = manga18ChapterInfo
+    ? `本章 第 ${manga18ChapterInfo.chapterNumber} 话`
+    : '本章';
+  const currentProgressTask = createProgressTask(state.taskId, currentChapterLabel, state.entries);
+  setActiveProgressTask(currentProgressTask.taskId);
+  syncSavedBackendBadge();
+  chrome.storage.onChanged?.addListener((changes, areaName) => {
+    if (areaName === 'local' && changes.mangaBackendMode && !state.running) {
+      updateBackendBadge(changes.mangaBackendMode.newValue === 'aigate' ? 'aigate' : 'local');
+    }
+  });
 
   const VIEWPORT_PADDING = 18;
   const LAUNCHER_SIZE = 36;
   const TEXT_TRIGGER_GAP = 8;
   let repositionFrame = null;
+  let manualPosition = null;
+  let pointerDrag = null;
+  let suppressLauncherClick = false;
+  let suppressLauncherClickTimer = null;
 
   function getVisibleRect(element) {
     if (!element || element.hidden) return null;
@@ -975,13 +1716,24 @@
   }
 
   function positionPanel(expanded = !card.hidden) {
+    if (manualPosition) {
+      positionManuallyPositionedPanel(expanded);
+      return;
+    }
+
     const protectedRects = getProtectedTranslationRects();
     const candidates = getPanelCandidates();
-    const cardWidth = expanded ? card.offsetWidth : 0;
-    const cardHeight = expanded ? card.offsetHeight : 0;
     let fallback = candidates[0];
 
     for (const candidate of candidates) {
+      if (expanded) {
+        const availableHeight = candidate.placement === 'above'
+          ? candidate.top - VIEWPORT_PADDING - 20
+          : window.innerHeight - VIEWPORT_PADDING - candidate.top - 56;
+        card.style.maxHeight = `${Math.max(1, Math.min(560, availableHeight))}px`;
+      }
+      const cardWidth = expanded ? card.offsetWidth : 0;
+      const cardHeight = expanded ? card.offsetHeight : 0;
       const launcherRect = {
         left: candidate.left,
         top: candidate.top,
@@ -1014,7 +1766,100 @@
       }
       if (avoidsText && fallback === candidates[0]) fallback = candidate;
     }
+    if (expanded) {
+      const availableHeight = fallback.placement === 'above'
+        ? fallback.top - VIEWPORT_PADDING - 20
+        : window.innerHeight - VIEWPORT_PADDING - fallback.top - 56;
+      card.style.maxHeight = `${Math.max(1, Math.min(560, availableHeight))}px`;
+    }
     setPanelPosition(fallback);
+  }
+
+  function clamp(value, minimum, maximum) {
+    return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+  }
+
+  function positionManuallyPositionedPanel(expanded = !card.hidden) {
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const maxLeft = viewportWidth - VIEWPORT_PADDING - LAUNCHER_SIZE;
+    const maxTop = viewportHeight - VIEWPORT_PADDING - LAUNCHER_SIZE;
+    manualPosition.left = clamp(manualPosition.left, VIEWPORT_PADDING, maxLeft);
+    manualPosition.top = clamp(manualPosition.top, VIEWPORT_PADDING, maxTop);
+
+    const roomToLeft = manualPosition.left + LAUNCHER_SIZE - VIEWPORT_PADDING;
+    const roomToRight = viewportWidth - VIEWPORT_PADDING - manualPosition.left;
+    const aboveRoom = manualPosition.top - VIEWPORT_PADDING - 20;
+    const belowRoom = viewportHeight - VIEWPORT_PADDING - manualPosition.top - 56;
+
+    let dock = roomToLeft > roomToRight ? 'right' : 'left';
+    let placement = aboveRoom > belowRoom ? 'above' : 'below';
+    if (expanded) {
+      const cardWidth = card.offsetWidth;
+      if (roomToLeft >= cardWidth && roomToRight < cardWidth) dock = 'right';
+      else if (roomToRight >= cardWidth && roomToLeft < cardWidth) dock = 'left';
+      else if (roomToLeft < cardWidth && roomToRight >= roomToLeft) dock = 'left';
+      else if (roomToRight < cardWidth && roomToLeft > roomToRight) dock = 'right';
+
+      const availableHeight = Math.max(1, Math.min(560, placement === 'above' ? aboveRoom : belowRoom));
+      card.style.maxHeight = `${availableHeight}px`;
+    }
+
+    setPanelPosition({
+      dock,
+      placement,
+      left: manualPosition.left,
+      top: manualPosition.top,
+    });
+  }
+
+  function beginLauncherDrag(event) {
+    if (!event.isPrimary || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    const rect = panel.getBoundingClientRect();
+    pointerDrag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startLeft: rect.left,
+      startTop: rect.top,
+      moved: false,
+    };
+    try {
+      launcher.setPointerCapture(event.pointerId);
+    } catch (_) {
+      // Pointer capture is best-effort; pointer events still work while over the launcher.
+    }
+  }
+
+  function moveLauncher(event) {
+    if (!pointerDrag || event.pointerId !== pointerDrag.pointerId) return;
+    const deltaX = event.clientX - pointerDrag.startX;
+    const deltaY = event.clientY - pointerDrag.startY;
+    if (!pointerDrag.moved && Math.hypot(deltaX, deltaY) < 5) return;
+
+    pointerDrag.moved = true;
+    event.preventDefault();
+    launcher.dataset.dragging = 'true';
+    manualPosition = {
+      left: pointerDrag.startLeft + deltaX,
+      top: pointerDrag.startTop + deltaY,
+    };
+    positionManuallyPositionedPanel();
+  }
+
+  function endLauncherDrag(event) {
+    if (!pointerDrag || event.pointerId !== pointerDrag.pointerId) return;
+    const moved = pointerDrag.moved;
+    pointerDrag = null;
+    delete launcher.dataset.dragging;
+    if (!moved) return;
+
+    suppressLauncherClick = true;
+    if (suppressLauncherClickTimer !== null) window.clearTimeout(suppressLauncherClickTimer);
+    suppressLauncherClickTimer = window.setTimeout(() => {
+      suppressLauncherClick = false;
+      suppressLauncherClickTimer = null;
+    }, 0);
   }
 
   function schedulePanelPosition() {
@@ -1060,7 +1905,10 @@
   }
 
   function updateAverageTime() {
-    const completed = state.translated + state.failed;
+    const task = getActiveProgressTask();
+    const completed = task
+      ? Array.from(task.pages.values()).filter(page => page.outcome === 'success' || page.outcome === 'failed').length
+      : state.translated + state.failed;
     if (!state.processingStartedAt || completed <= 0) {
       averageTimeNode.textContent = '平均每张图：--';
       return;
@@ -1082,7 +1930,10 @@
   function startProcessingClock() {
     resetProcessingClock();
     state.processingStartedAt = performance.now();
-    state.averageTimer = window.setInterval(updateAverageTime, 1000);
+    state.averageTimer = window.setInterval(() => {
+      updateAverageTime();
+      if (state.progressExpanded) updateProgressView();
+    }, 1000);
     updateAverageTime();
   }
 
@@ -1106,7 +1957,7 @@
     const incompleteCount = getIncompleteEntries().length;
     const canContinueCache = state.cacheAvailable && incompleteCount > 0;
     const hasTranslatedImages = state.entries.some(entry => Boolean(entry.resultUrl));
-    startButton.disabled = state.running;
+    startButton.disabled = state.running || state.cacheChecking;
     pauseButton.disabled = !state.running;
     pauseButton.textContent = state.paused ? '继续' : '暂停';
     retryButton.hidden = state.running || state.failed <= 0;
@@ -1121,10 +1972,12 @@
     viewToggleButton.disabled = state.running || !hasTranslatedImages;
     viewToggleButton.textContent = state.showingOriginal ? '显示翻译图' : '显示原图';
     nextChapterButton.hidden = !nextChapterUrl;
-    nextChapterButton.disabled = state.running || !nextChapterUrl;
-    nextChapterButton.textContent = manga18ChapterInfo
-      ? `翻译下一话（第 ${manga18ChapterInfo.chapterNumber + 1} 话）`
-      : '翻译下一话';
+    nextChapterButton.disabled = state.running || state.cacheChecking || !nextChapterUrl;
+    nextChapterButton.textContent = state.nextChapterRunning
+      ? `正在翻译第 ${manga18ChapterInfo.chapterNumber + 1} 话…`
+      : (manga18ChapterInfo
+        ? `翻译下一话（第 ${manga18ChapterInfo.chapterNumber + 1} 话）`
+        : '翻译下一话');
     launcher.dataset.running = String(state.running);
     startButton.textContent = state.running
       ? '处理中…'
@@ -1306,30 +2159,43 @@
       console.warn('[漫画翻译] 缓存检查失败，将继续使用实时翻译:', error);
     } finally {
       state.running = false;
+      state.cacheChecking = false;
       setRunningControls();
     }
   }
 
-  async function processEntries(entries) {
-    for (let offset = 0; offset < entries.length; offset += MANGA_BATCH_WINDOW_SIZE) {
+  async function processEntries(entries, { retry = false } = {}) {
+    const pluginBatchSize = state.pluginBatchSize;
+    for (let offset = 0; offset < entries.length; offset += pluginBatchSize) {
       while (state.paused && state.running) {
         await sleep(120);
       }
       if (!state.running) break;
-      const batch = entries.slice(offset, offset + MANGA_BATCH_WINDOW_SIZE)
+      const batch = entries.slice(offset, offset + pluginBatchSize)
         .filter(entry => entry && entry.completed !== true);
       if (!batch.length) continue;
       const firstIndex = state.entries.indexOf(batch[0]);
       const lastIndex = state.entries.indexOf(batch[batch.length - 1]);
       setStatus(
-        `正在提交第 ${firstIndex + 1}–${lastIndex + 1} 页（批输入窗口 ${batch.length}/${MANGA_BATCH_WINDOW_SIZE}）…`,
+        `正在提交第 ${firstIndex + 1}–${lastIndex + 1} 页（每次 ${pluginBatchSize} 张）…`,
       );
-      await translateMangaBatchThroughBackground(batch);
+      await translateMangaBatchThroughBackground(batch, { retry });
     }
   }
 
   async function translateCurrentPage() {
     if (state.running) return;
+    setActiveProgressTask(currentProgressTask.taskId);
+    currentProgressTask.currentRunId = '';
+    currentProgressTask.batchPageIndices = [];
+    currentProgressTask.activeRunPageIndices = [];
+    currentProgressTask.lastSequence = 0;
+    currentProgressTask.pages.forEach(page => {
+      page.outcome = 'pending';
+      page.lastError = '';
+      page.stages = Object.fromEntries(PROGRESS_STAGES.map(stageName => [stageName, emptyStageProgress()]));
+    });
+    updateProgressView();
     state.running = true;
     state.paused = false;
     state.translated = 0;
@@ -1344,11 +2210,13 @@
     });
     resetProcessingClock();
     setRunningControls();
-    setStatus('正在启动本地翻译后端…');
+    setStatus('正在连接翻译后端…');
 
     try {
       const ready = await sendMessage({ action: 'prepareMangaTranslation' });
-      if (!ready.success) throw new Error(ready.error || '本地后端启动失败');
+      if (!ready.success) throw new Error(ready.error || '翻译后端启动失败');
+      applyPreparedPluginBatchSize(ready);
+      setProgressBackend(currentProgressTask, ready.backend, ready.pageProgressVersion);
       startProcessingClock();
 
       await processEntries(state.entries);
@@ -1363,6 +2231,7 @@
       state.running = false;
       state.paused = false;
       setRunningControls();
+      syncSavedBackendBadge();
     }
   }
 
@@ -1376,15 +2245,18 @@
 
     state.running = true;
     state.paused = false;
+    setActiveProgressTask(currentProgressTask.taskId);
     setAllImageSources(false);
     resetProcessingClock();
     setRunningControls();
     setStatus(`准备重试 ${failedEntries.length} 个失败页面…`);
     try {
       const ready = await sendMessage({ action: 'prepareMangaTranslation' });
-      if (!ready.success) throw new Error(ready.error || '本地后端启动失败');
+      if (!ready.success) throw new Error(ready.error || '翻译后端启动失败');
+      applyPreparedPluginBatchSize(ready);
+      setProgressBackend(currentProgressTask, ready.backend, ready.pageProgressVersion);
       startProcessingClock();
-      await processEntries(failedEntries);
+      await processEntries(failedEntries, { retry: true });
       if (state.running) {
         setStatus(
           state.failed
@@ -1400,6 +2272,7 @@
       state.running = false;
       state.paused = false;
       setRunningControls();
+      syncSavedBackendBadge();
     }
   }
 
@@ -1413,15 +2286,18 @@
 
     state.running = true;
     state.paused = false;
+    setActiveProgressTask(currentProgressTask.taskId);
     setAllImageSources(false);
     resetProcessingClock();
     setRunningControls();
     setStatus(`继承 ${state.translated} 页缓存，继续处理 ${incompleteEntries.length} 页…`);
     try {
       const ready = await sendMessage({ action: 'prepareMangaTranslation' });
-      if (!ready.success) throw new Error(ready.error || '本地后端启动失败');
+      if (!ready.success) throw new Error(ready.error || '翻译后端启动失败');
+      applyPreparedPluginBatchSize(ready);
+      setProgressBackend(currentProgressTask, ready.backend, ready.pageProgressVersion);
       startProcessingClock();
-      await processEntries(incompleteEntries);
+      await processEntries(incompleteEntries, { retry: true });
       if (state.running) {
         setStatus(
           state.failed
@@ -1437,39 +2313,48 @@
       state.running = false;
       state.paused = false;
       setRunningControls();
+      syncSavedBackendBadge();
     }
   }
 
-  async function translateNextManga18Chapter() {
-    if (!manga18ChapterInfo || !nextChapterUrl || state.running) return;
-    nextChapterButton.disabled = true;
-    try {
-      const randomBytes = new Uint8Array(16);
-      window.crypto.getRandomValues(randomBytes);
-      const nonce = Array.from(randomBytes, byte => byte.toString(16).padStart(2, '0')).join('');
-      await extensionStorageRequest('set', {
-        [MANGA18_AUTO_TRANSLATE_STORAGE_KEY]: {
-          nonce,
-          seriesPath: manga18ChapterInfo.seriesPath,
-          chapterNumber: manga18ChapterInfo.chapterNumber + 1,
-          createdAt: Date.now(),
-        },
-      });
-      const targetUrl = new URL(nextChapterUrl.href);
-      targetUrl.hash = `${MANGA18_AUTO_TRANSLATE_HASH_PREFIX.slice(1)}${nonce}`;
-      setStatus(
-        `正在打开第 ${manga18ChapterInfo.chapterNumber + 1} 话，页面加载后会自动开始翻译…`,
-        'success',
-      );
-      location.assign(targetUrl.href);
-    } catch (error) {
-      nextChapterButton.disabled = false;
-      setStatus(`无法启动下一话自动翻译：${error.message || error}`, 'error');
-    }
+  function translateNextManga18Chapter() {
+    void translateManga18NextChapterInBackground();
   }
 
-  launcher.addEventListener('click', () => setExpanded(card.hidden));
+  launcher.addEventListener('pointerdown', beginLauncherDrag);
+  launcher.addEventListener('pointermove', moveLauncher);
+  launcher.addEventListener('pointerup', endLauncherDrag);
+  launcher.addEventListener('pointercancel', endLauncherDrag);
+  launcher.addEventListener('lostpointercapture', endLauncherDrag);
+  launcher.addEventListener('click', event => {
+    if (suppressLauncherClick) {
+      suppressLauncherClick = false;
+      if (suppressLauncherClickTimer !== null) window.clearTimeout(suppressLauncherClickTimer);
+      suppressLauncherClickTimer = null;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    setExpanded(card.hidden);
+  });
   collapseButton.addEventListener('click', () => setExpanded(false));
+  detailToggleButton.addEventListener('click', () => setProgressDetailsExpanded(!state.progressExpanded));
+  progressRowsNode.addEventListener('click', event => {
+    const row = event.target.closest('.progress-row');
+    const task = getActiveProgressTask();
+    if (!row || !task) return;
+    state.selectedProgressPage = { taskId: task.taskId, pageIndex: Number(row.dataset.pageIndex) };
+    updateProgressView();
+  });
+  progressRowsNode.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const row = event.target.closest('.progress-row');
+    const task = getActiveProgressTask();
+    if (!row || !task) return;
+    event.preventDefault();
+    state.selectedProgressPage = { taskId: task.taskId, pageIndex: Number(row.dataset.pageIndex) };
+    updateProgressView();
+  });
   startButton.addEventListener('click', translateCurrentPage);
   retryButton.addEventListener('click', retryFailedPages);
   continueButton.addEventListener('click', continueIncompletePages);
@@ -1486,24 +2371,18 @@
     state.paused = !state.paused;
     updateAverageTime();
     setRunningControls();
-    setStatus(state.paused ? `已暂停：当前页面已完成 ${state.translated} 页` : '已继续处理当前页面', state.paused ? 'info' : 'success');
+    const pauseMessage = state.nextChapterRunning
+      ? (state.paused ? '已暂停后续批次；当前批次继续处理并更新进度。' : '已继续翻译下一话')
+      : (state.paused ? '已暂停后续批次；当前批次继续处理并更新进度。' : '已继续处理当前页面');
+    setStatus(pauseMessage, state.paused ? 'info' : 'success');
   });
   window.addEventListener('resize', schedulePanelPosition);
   window.addEventListener('immersive-translation-trigger-change', schedulePanelPosition);
   document.addEventListener('selectionchange', schedulePanelPosition, { passive: true });
   positionPanel(false);
+  state.cacheChecking = Boolean(manga18ChapterInfo);
   setRunningControls();
-  if (autoTranslateNextChapter) {
-    card.hidden = false;
-    launcher.setAttribute('aria-expanded', 'true');
-    launcher.setAttribute('aria-label', '收起图片翻译');
-    launcher.title = '收起图片翻译';
-    positionPanel(true);
-    setStatus(`已进入第 ${manga18ChapterInfo.chapterNumber} 话，正在自动开始翻译…`, 'success');
-    void translateCurrentPage();
-  } else {
-    restoreCachedResults();
-  }
+  restoreCachedResults();
   }
 
   initialiseMangaPage().catch(error => {

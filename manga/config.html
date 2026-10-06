@@ -15,7 +15,7 @@
         <h1>漫画翻译配置</h1>
         <p class="subtitle">沿用 manga-translator-ui 的设置分组。当前配置会同时用于本地 App 和 AIGate 云端实例。</p>
       </div>
-      <a class="button secondary back-link" href="manga.html">返回章节翻译</a>
+      <a class="button secondary back-link" href="workbench.html#plugin-config">插件配置</a>
     </header>
 
     <section class="panel config-toolbar-panel">
@@ -32,22 +32,31 @@
         </div>
       </div>
       <p id="config-status" class="config-status" aria-live="polite">正在读取配置…</p>
-      <p class="config-note">配置保存在此浏览器的本地扩展存储中。应用时会发送到当前选择的本地或云端后端；AIGate 仅在运行中的服务进程内使用配置，不会将配置文件写入共享磁盘。导出文件会包含配置中的所有字段（包括其中已有的密钥）。</p>
+      <p class="config-note">配置由插件独立保存；应用时只更新当前后端运行会话，不修改 App 的 config.json。导出文件会包含所有字段（包括其中已有的密钥）。</p>
     </section>
 
     <section class="panel settings-panel">
       <div class="settings-heading">
         <div>
           <h2>设置项目</h2>
-          <p>数值与开关可直接编辑；有候选值的设置支持搜索，也可以保留或输入 manga-translator-ui 的原始值。</p>
+          <p>布局与参数联动遵循桌面 App。未显示或暂不可用的参数仍保留在配置中。</p>
         </div>
         <label class="settings-search">
           <span class="visually-hidden">筛选当前分组</span>
-          <input id="settings-search" type="search" placeholder="筛选当前分组…">
+          <input id="settings-search" type="search" placeholder="搜索全部分组…">
         </label>
       </div>
       <nav id="settings-tabs" class="settings-tabs" aria-label="配置分组"></nav>
-      <div id="settings-fields" class="settings-fields"></div>
+      <div class="settings-workspace">
+        <div id="settings-fields" class="settings-fields" role="tabpanel"></div>
+        <aside id="setting-details" class="setting-details" aria-live="polite">
+          <p class="details-kicker">参数说明</p>
+          <h3 id="details-title">选择一个参数</h3>
+          <p id="details-description">点击或使用键盘聚焦左侧参数行，这里会显示参数用途和存储键。</p>
+          <code id="details-key"></code>
+          <p id="details-dependency" class="details-dependency"></p>
+        </aside>
+      </div>
     </section>
 
     <section class="panel extras-panel">

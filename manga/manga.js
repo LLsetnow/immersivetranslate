@@ -8,18 +8,46 @@
   const AIGATE_TEMP_OUTPUT_FOLDER = '/tmp/immersive-translate-output';
   const TRANSLATE_PATH = '/execute_image/translate';
   const NATIVE_HOST_NAME = 'com.timecyber.immersivetranslate.manga_backend';
+  const DEFAULT_PLUGIN_BATCH_SIZE = 10;
+  const MIN_PLUGIN_BATCH_SIZE = 1;
+  const MAX_PLUGIN_BATCH_SIZE = 10;
+
+  function normalizePluginBatchSize(value, fallback = DEFAULT_PLUGIN_BATCH_SIZE) {
+    const numericValue = Number(value);
+    if (!Number.isFinite(numericValue)) return fallback;
+    return Math.max(
+      MIN_PLUGIN_BATCH_SIZE,
+      Math.min(MAX_PLUGIN_BATCH_SIZE, Math.trunc(numericValue)),
+    );
+  }
+
   const state = {
     htmlFile: null,
+    view: new URLSearchParams(window.location.search).get('view') || 'full',
+    sourceKind: 'web',
+    sourceSignatures: [],
+    pendingResumeRecord: null,
     htmlTitle: '',
     sourceUrl: '',
     downloadBaseName: 'translated-chapter',
     images: [],
     running: false,
     paused: false,
+    externalTaskActive: false,
+    workbenchVisible: true,
+    logScrollPaused: false,
+    logSource: 'current',
+    selectedImageIndex: -1,
+    previewMode: 'compare',
+    localBridgeReady: false,
+    remoteServiceReady: false,
     logOffset: 0,
     logPolling: false,
     logTimer: null,
     outputFolder: '',
+    taskOutputFolder: '',
+    taskOutputFolderFromResume: false,
+    batchSize: DEFAULT_PLUGIN_BATCH_SIZE,
     taskId: '',
     backendMode: 'local',
     aigateToken: '',
@@ -32,17 +60,43 @@
     aigateSkus: [],
     aigateImages: [],
     aigateInstances: [],
+    releasedAigateInstanceIds: new Set(),
     refreshingAigateResources: false,
     creatingAigateInstance: false,
     startingAigateTranslation: false,
     checkingAigateConnectivity: false,
     stoppingAigateInstance: false,
+    releasingAigateInstance: false,
     configRevision: '',
     outputFolderReady: Promise.resolve(),
+    cacheRestorePromise: Promise.resolve(),
   };
 
   const $ = selector => document.querySelector(selector);
   const fileInput = $('#chapter-html');
+  const imageFilesInput = $('#image-files');
+  const chooseImagesButton = $('#choose-images');
+  const chooseHtmlButton = $('#choose-chapter-html');
+  const logSourceInput = $('#backend-log-source');
+  const pauseBackendLogButton = $('#pause-backend-log');
+  const saveImagesButton = $('#save-translated-images');
+  const retryFailedButton = $('#retry-failed-images');
+  const resumeTaskBox = $('#resume-task-box');
+  const resumeTaskLabel = $('#resume-task-label');
+  const resumeTaskButton = $('#resume-task-button');
+  const standaloneSummary = $('#standalone-summary');
+  const connectionHelp = $('#connection-help');
+  const localBridgeStatus = $('#local-bridge-status');
+  const remoteServiceStatus = $('#remote-service-status');
+  const aigateEndpointDisplay = $('#aigate-endpoint-display');
+  const releaseAigateButton = $('#release-aigate-instance');
+  const connectionSummary = $('#connection-summary');
+  const backendStatusBadge = $('#backend-status-badge');
+  const previewName = $('#preview-name');
+  const previewEmpty = $('#preview-empty');
+  const previewImages = $('#preview-images');
+  const previewOriginal = $('#preview-original');
+  const previewTranslated = $('#preview-translated');
   const fileDrop = $('.file-drop');
   const fileLabel = $('#file-label');
   const imageCount = $('#image-count');
@@ -51,6 +105,8 @@
   const endpointInput = $('#server-endpoint');
   const sourceBaseInput = $('#source-base');
   const outputFolderInput = $('#manga-output-folder');
+  const pluginBatchSizeInput = $('#plugin-batch-size');
+  const pluginBatchSizeStatus = $('#plugin-batch-size-status');
   const chooseOutputFolderButton = $('#choose-output-folder');
   const statusText = $('#status-text');
   const progressText = $('#progress-text');
@@ -78,12 +134,57 @@
   const startAigateButton = $('#start-aigate-instance');
   const checkAigateServiceButton = $('#check-aigate-service');
   const stopAigateButton = $('#stop-aigate-instance');
+  document.body.dataset.view = state.view;
   const EIGHTEEN_COMIC_BODY_IMAGE_SELECTOR = '.scramble-page:not(.thewayhome) > img';
   const EIGHTEEN_COMIC_IMAGE_ATTRIBUTES = ['data-original', 'data-src', 'data-lazy-src', 'src'];
+  if (state.view === 'plugin') $('#source-panel-title').textContent = '本地服务与结果保存';
 
   function setStatus(message, kind = 'info') {
     statusText.textContent = message;
     statusText.dataset.kind = kind;
+    if (connectionHelp) connectionHelp.dataset.visible = String(kind === 'error' && /服务|后端|连接|桥接|AIGate/i.test(message));
+  }
+
+  function reportBackendStatus() {
+    const ready = state.backendMode === 'local'
+      ? state.localBridgeReady
+      : state.localBridgeReady && state.remoteServiceReady;
+    const text = state.backendMode === 'aigate'
+      ? (ready ? 'AIGate 与本地保存服务已连接' : 'AIGate 云端 · 本地保存桥')
+      : (ready ? '本地服务已连接' : '本地服务');
+    if (connectionSummary) {
+      connectionSummary.textContent = ready ? '可以翻译' : '尚未检查';
+      connectionSummary.dataset.kind = ready ? 'success' : 'info';
+    }
+    if (backendStatusBadge) backendStatusBadge.textContent = text;
+    if (localBridgeStatus) {
+      localBridgeStatus.textContent = `本地保存桥：${state.localBridgeReady ? '已连接' : '未连接'}`;
+      localBridgeStatus.dataset.kind = state.localBridgeReady ? 'success' : 'info';
+    }
+    if (remoteServiceStatus) {
+      remoteServiceStatus.hidden = state.backendMode !== 'aigate';
+      remoteServiceStatus.textContent = `AIGate 云端：${state.remoteServiceReady ? '已连接' : '未连接'}`;
+      remoteServiceStatus.dataset.kind = state.remoteServiceReady ? 'success' : 'info';
+    }
+    if (aigateEndpointDisplay) aigateEndpointDisplay.textContent = `云端服务地址：${state.aigateEndpoint || '未启动'}`;
+    if (window.parent !== window && state.view !== 'standalone') {
+      window.parent.postMessage({
+        type: 'workbenchBackendStatus',
+        kind: ready ? 'ready' : 'info',
+        text,
+      }, location.origin);
+    }
+  }
+
+  function reportTaskStatus(active, done = 0, total = state.images.length) {
+    if (window.parent === window) return;
+    window.parent.postMessage({
+      type: 'workbenchTaskStatus',
+      active: Boolean(active || state.running || state.paused || state.externalTaskActive),
+      done,
+      total,
+      title: state.htmlTitle || '独立翻译',
+    }, location.origin);
   }
 
   function setProgress(done, total) {
@@ -122,7 +223,7 @@
     backendLog.textContent = nextText.length > maxDisplayCharacters
       ? nextText.slice(-maxDisplayCharacters)
       : nextText;
-    if (shouldStickToBottom) backendLog.scrollTop = backendLog.scrollHeight;
+    if (shouldStickToBottom && !state.logScrollPaused) backendLog.scrollTop = backendLog.scrollHeight;
   }
 
   function filterLogPollingNoise(text) {
@@ -134,7 +235,7 @@
   async function pollBackendLog() {
     if (state.logPolling) return;
     state.logPolling = true;
-    const mode = state.backendMode;
+      const mode = state.logSource === 'local' ? 'local' : state.backendMode;
     try {
       let endpoint;
       const headers = {};
@@ -155,7 +256,7 @@
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json();
-      if (mode !== state.backendMode) return;
+      if (mode !== state.backendMode && state.logSource !== 'local') return;
       const nextOffset = Number(payload.offset);
       if (Number.isFinite(nextOffset)) state.logOffset = nextOffset;
       appendBackendLog(filterLogPollingNoise(payload.text));
@@ -178,7 +279,7 @@
     if (state.logTimer) return;
     pollBackendLog();
     state.logTimer = window.setInterval(() => {
-      if (document.visibilityState !== 'hidden') pollBackendLog();
+      if (state.workbenchVisible && document.visibilityState !== 'hidden') pollBackendLog();
     }, 2000);
   }
 
@@ -498,25 +599,115 @@
     const card = document.createElement('article');
     card.className = 'image-card';
     card.dataset.index = String(index);
+    card.tabIndex = 0;
+    card.setAttribute('role', 'group');
+    card.setAttribute('aria-label', '预览第 ' + (index + 1) + ' 张：' + item.name);
     card.innerHTML = `
-      <div class="image-frame"><img loading="lazy" alt="${item.name}"></div>
+      <div class="image-frame"><img loading="lazy"></div>
       <div class="image-info">
-        <div class="image-name" title="${item.name}">${item.name}</div>
-        <div class="image-status">等待翻译</div>
+        <div class="image-name"></div>
+        <div class="image-status"></div>
+        <div class="image-card-actions"><button type="button" data-move="up" aria-label="上移">↑</button><button type="button" data-move="down" aria-label="下移">↓</button><button type="button" data-remove="true" aria-label="移除图片">移除</button></div>
       </div>
     `;
     const image = card.querySelector('img');
+    image.alt = item.name;
     image.src = item.url;
+    card.querySelector('.image-name').textContent = item.name;
+    card.querySelector('.image-name').title = item.name;
+    card.querySelector('.image-status').textContent = item.statusText || '等待翻译';
     image.addEventListener('error', () => updateImageStatus(index, '源图片无法加载', 'error'));
+    if (item.status) card.classList.add(item.status);
+    card.addEventListener('click', () => selectPreviewImage(index));
+    card.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectPreviewImage(index);
+      }
+    });
+    card.querySelectorAll('button').forEach(button => button.addEventListener('click', event => {
+      event.stopPropagation();
+      if (button.hasAttribute('data-remove')) removeImage(index);
+      else moveImage(index, button.dataset.move === 'up' ? -1 : 1);
+    }));
     return card;
+  }
+
+  function moveImage(index, delta) {
+    if (state.running || state.paused) return;
+    const target = index + delta;
+    if (target < 0 || target >= state.images.length) return;
+    [state.images[index], state.images[target]] = [state.images[target], state.images[index]];
+    state.selectedImageIndex = target;
+    updateTaskIdentity();
+    imageCount.textContent = `${state.images.length} 张图片`;
+    chapterTitle.textContent = `${state.htmlTitle} · ${state.images.length} 张图片`;
+    renderImages();
+    saveIndependentTaskRecord(state.sourceKind);
+  }
+
+  function removeImage(index) {
+    if (state.running || state.paused) return;
+    const [removed] = state.images.splice(index, 1);
+    if (removed?.objectUrl) URL.revokeObjectURL(removed.objectUrl);
+    state.selectedImageIndex = Math.min(Math.max(0, index), state.images.length - 1);
+    updateTaskIdentity();
+    imageCount.textContent = `${state.images.length} 张图片`;
+    chapterTitle.textContent = `${state.htmlTitle} · ${state.images.length} 张图片`;
+    translateButton.disabled = state.images.length === 0;
+    const hasResults = state.images.some(item => item.resultDataUrl);
+    downloadButton.disabled = !hasResults;
+    saveImagesButton.disabled = !hasResults;
+    setProgress(state.images.filter(item => item.resultDataUrl).length, state.images.length);
+    renderImages();
+    saveIndependentTaskRecord(state.sourceKind);
+  }
+
+  function updateTaskIdentity() {
+    if (state.sourceKind === 'files') {
+      const fingerprint = state.images.map(item => `${item.signature?.name || item.name}\n${item.signature?.size || 0}\n${item.signature?.hash || ''}`).join('\n');
+      state.taskId = createTaskId('local-files\n' + fingerprint, state.images.map(item => item.name));
+    } else {
+      state.taskId = createTaskId(state.sourceUrl || state.htmlTitle, state.images.map(item => item.imageUrl || item.url));
+    }
+  }
+
+  function selectPreviewImage(index) {
+    const item = state.images[index];
+    if (!item) return;
+    state.selectedImageIndex = index;
+    imageGrid.querySelectorAll('.image-card').forEach(card => {
+      card.classList.toggle('selected', Number(card.dataset.index) === index);
+      card.setAttribute('aria-selected', String(Number(card.dataset.index) === index));
+    });
+    previewName.textContent = item.name;
+    previewEmpty.hidden = true;
+    previewImages.hidden = false;
+    previewOriginal.src = item.url;
+    if (item.resultUrl) previewTranslated.src = item.resultUrl;
+    else previewTranslated.removeAttribute('src');
+    previewTranslated.hidden = !item.resultUrl;
+    previewTranslated.closest('figure').classList.toggle('preview-unavailable', !item.resultUrl);
+    previewTranslated.previousElementSibling.textContent = item.resultUrl
+      ? '译图'
+      : item.pendingSave ? '译图待保存' : item.status === 'error' ? '翻译失败' : '等待译图';
+    previewImages.className = 'preview-images mode-' + state.previewMode;
+    previewImages.dataset.mode = state.previewMode;
+    previewImages.closest('.preview-pane').dataset.mode = state.previewMode;
+    document.querySelectorAll('[data-preview-mode]').forEach(button => {
+      button.setAttribute('aria-pressed', String(button.dataset.previewMode === state.previewMode));
+    });
   }
 
   function updateImageStatus(index, message, kind = '') {
     const card = imageGrid.querySelector(`[data-index="${index}"]`);
+    const item = state.images[index];
+    if (item) { item.status = kind; item.statusText = message; }
     if (!card) return;
     card.classList.remove('processing', 'done', 'error');
     if (kind) card.classList.add(kind);
     card.querySelector('.image-status').textContent = message;
+    if (state.selectedImageIndex === index) selectPreviewImage(index);
   }
 
   function renderImages() {
@@ -524,16 +715,30 @@
     imageGrid.classList.toggle('empty-state', state.images.length === 0);
     if (!state.images.length) {
       imageGrid.innerHTML = '<div class="empty-icon">▧</div><p>当前内容中没有识别到可翻译图片</p>';
+      state.selectedImageIndex = -1;
+      previewImages.hidden = true;
+      previewEmpty.hidden = false;
+      downloadButton.disabled = true;
+      saveImagesButton.disabled = true;
       return;
     }
     state.images.forEach((item, index) => imageGrid.appendChild(makeImageCard(item, index)));
+    if (state.images.length) selectPreviewImage(state.selectedImageIndex >= 0 ? state.selectedImageIndex : 0);
+    else {
+      state.selectedImageIndex = -1;
+      previewImages.hidden = true;
+      previewEmpty.hidden = false;
+    }
   }
 
-  function loadImageList(urls, title, sourceName = '', sourceUrl = '') {
+  function loadImageList(urls, title, sourceName = '', sourceUrl = '', sourceKind = '', taskId = '') {
     state.htmlFile = sourceName ? { name: sourceName } : null;
     state.htmlTitle = title || '翻译章节';
     state.sourceUrl = sourceUrl || '';
-    state.taskId = createTaskId(state.sourceUrl || state.htmlTitle, urls);
+    state.sourceKind = sourceKind || (sourceUrl ? 'web' : (sourceName ? 'html' : 'web'));
+    state.taskId = taskId || createTaskId(state.sourceUrl || state.htmlTitle, urls);
+    state.taskOutputFolder = taskId ? String(state.pendingResumeRecord?.outputFolder || '') : '';
+    state.taskOutputFolderFromResume = Boolean(taskId && state.pendingResumeRecord);
     state.downloadBaseName = safeDownloadBaseName(sourceName || state.htmlTitle);
     state.images = urls.map((url, index) => ({
       url,
@@ -541,7 +746,12 @@
       blob: null,
       resultUrl: '',
       resultDataUrl: '',
+      sourceBlob: null,
+      imageUrl: url,
+      status: '',
+      statusText: '等待翻译',
     }));
+    state.selectedImageIndex = state.images.length ? 0 : -1;
     fileLabel.textContent = sourceName ? `当前来源：${sourceName}` : '当前网页图片';
     imageCount.textContent = `${state.images.length} 张图片`;
     chapterTitle.textContent = `${state.htmlTitle} · ${state.images.length} 张图片`;
@@ -552,13 +762,219 @@
     setProgress(0, state.images.length);
     setStatus(state.images.length ? '图片已读取，可以开始翻译' : '没有识别到图片', state.images.length ? 'success' : 'error');
     renderImages();
+    saveIndependentTaskRecord(state.sourceKind);
+    state.cacheRestorePromise = restoreCachedResults();
   }
 
   async function loadChapter(file) {
     const htmlText = await file.text();
     const parsed = extractImageUrls(htmlText, sourceBaseInput.value);
-    loadImageList(parsed.urls, parsed.title, file.name);
+    if (!parsed.urls.length) {
+      const hasRelative = /(?:src|data-src|data-original)\s*=\s*["'](?!https?:|data:|\/\/)[^"']+/i.test(htmlText);
+      document.body.dataset.needsBase = String(hasRelative);
+      throw new Error(hasRelative
+        ? 'HTML 中的漫画图片使用相对路径。填写可访问的图片基础地址，或直接选择对应图片文件。'
+        : 'HTML 中没有识别到漫画图片；请检查普通 img、懒加载属性或 slides_p_path 内容。');
+    }
+    const pendingResume = state.pendingResumeRecord;
+    if (pendingResume?.kind === 'html') {
+      const importedTaskId = createTaskId(pendingResume.title || parsed.title || '翻译章节', parsed.urls);
+      if (importedTaskId !== pendingResume.taskId) {
+        throw new Error('所选 HTML 与待恢复任务的图片列表不匹配；请重新选择原章节，或取消恢复后作为新任务导入。');
+      }
+    }
+    document.body.dataset.needsBase = 'false';
+    loadImageList(parsed.urls, parsed.title, file.name, '', 'html', pendingResume?.taskId || '');
+    state.sourceKind = 'html';
+    state.pendingResumeRecord = null;
+    resumeTaskBox.hidden = true;
+    saveIndependentTaskRecord('html');
   }
+
+  async function fingerprintFiles(files) {
+    const signatures = [];
+    for (const file of files) {
+      const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+      const hash = Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, '0')).join('');
+      signatures.push({ name: file.name, size: file.size, hash });
+    }
+    return signatures;
+  }
+
+  async function loadImageFiles(fileList) {
+    let files = Array.from(fileList || []).filter(file => /^image\/(png|jpeg|webp)$/i.test(file.type));
+    if (!files.length) throw new Error('请选择 PNG、JPEG 或 WebP 图片');
+    let signatures = await fingerprintFiles(files);
+    const pendingResume = state.pendingResumeRecord?.kind === 'files' ? state.pendingResumeRecord : null;
+    if (pendingResume) {
+      const expected = Array.isArray(pendingResume.signatures) ? pendingResume.signatures : [];
+      if (expected.length !== Number(pendingResume.count) || files.length !== expected.length
+        || expected.some(item => !item || !item.name || !Number.isFinite(Number(item.size)) || !/^[a-f0-9]{64}$/i.test(String(item.hash || '')))) {
+        throw new Error('待恢复任务缺少完整的原图校验信息，不能安全恢复；可取消恢复后将所选图片作为新任务导入。');
+      }
+      const keyOf = item => `${item.name}\n${item.size}\n${String(item.hash).toLowerCase()}`;
+      const available = new Map();
+      files.forEach((file, index) => {
+        const key = keyOf(signatures[index]);
+        if (!available.has(key)) available.set(key, []);
+        available.get(key).push({ file, signature: signatures[index] });
+      });
+      const ordered = expected.map(signature => available.get(keyOf(signature))?.shift());
+      if (ordered.some(item => !item)) {
+        throw new Error('所选图片与待恢复任务不匹配；请重新选择原图，或取消恢复后作为新任务导入。');
+      }
+      files = ordered.map(item => item.file);
+      signatures = ordered.map(item => item.signature);
+      const resumedFingerprint = signatures.map(item => [item.name, item.size, item.hash].join('\n')).join('\n');
+      const resumedTaskId = createTaskId('local-files\n' + resumedFingerprint, files.map(item => item.name));
+      if (resumedTaskId !== pendingResume.taskId) {
+        throw new Error('所选原图与待恢复任务标识不一致；请取消恢复后作为新任务导入。');
+      }
+    }
+    const fingerprint = signatures.map(item => [item.name, item.size, item.hash].join('\n')).join('\n');
+    state.htmlFile = null;
+    state.sourceKind = 'files';
+    state.htmlTitle = files.length === 1 ? files[0].name : '独立翻译 · ' + files.length + ' 张图片';
+    state.sourceUrl = '';
+    state.sourceSignatures = signatures;
+    state.taskOutputFolder = pendingResume ? String(pendingResume.outputFolder || '') : '';
+    state.taskOutputFolderFromResume = Boolean(pendingResume);
+    state.taskId = pendingResume?.taskId || createTaskId('local-files\n' + fingerprint, files.map(item => item.name));
+    state.downloadBaseName = safeDownloadBaseName(files.length === 1 ? files[0].name : state.htmlTitle);
+    state.images.forEach(item => { if (item.objectUrl) URL.revokeObjectURL(item.objectUrl); });
+    state.images = files.map((file, index) => {
+      const objectUrl = URL.createObjectURL(file);
+      return {
+        url: objectUrl,
+        name: file.name || ('page-' + (index + 1) + '.png'),
+        sourceBlob: file,
+        signature: signatures[index],
+        imageUrl: 'local-file:' + signatures[index].hash,
+        objectUrl,
+        resultUrl: '',
+        resultDataUrl: '',
+      };
+    });
+    state.pendingResumeRecord = null;
+    resumeTaskBox.hidden = true;
+    state.selectedImageIndex = 0;
+    fileLabel.textContent = files.length + ' 张图片已选择';
+    imageCount.textContent = files.length + ' 张图片';
+    chapterTitle.textContent = state.htmlTitle;
+    translateButton.disabled = false;
+    downloadButton.disabled = true;
+    setProgress(0, files.length);
+    setStatus('图片已读取，可以开始翻译', 'success');
+    renderImages();
+    await saveIndependentTaskRecord('files');
+    await restoreCachedResults();
+  }
+
+  async function saveIndependentTaskRecord(kind = state.sourceKind) {
+    if (!state.taskId || !state.images.length) return;
+    await state.outputFolderReady;
+    if (!state.taskOutputFolder) state.taskOutputFolder = state.outputFolder;
+    const record = {
+      taskId: state.taskId,
+      kind,
+      title: state.htmlTitle,
+      sourceUrl: state.sourceUrl,
+      imageUrls: state.images.map(item => /^https?:\/\//i.test(item.imageUrl || item.url) ? (item.imageUrl || item.url) : ''),
+      fileNames: state.images.map(item => item.name),
+      signatures: kind === 'files' ? state.sourceSignatures : [],
+      outputFolder: state.taskOutputFolder,
+      count: state.images.length,
+      updatedAt: Date.now(),
+    };
+    await storageSet({ mangaLastIndependentTask: record });
+  }
+
+  async function restoreCachedResults() {
+    if (!state.taskId || !state.images.length) return;
+    try {
+      const cache = await sendRuntimeMessage({
+        action: 'getMangaCache',
+        taskId: state.taskId,
+        sourceUrl: state.sourceUrl,
+        imageUrls: state.images.map(item => item.imageUrl || item.url),
+        outputFolder: state.taskOutputFolder,
+      });
+      if (!cache.success || !cache.found) return;
+      let restored = 0;
+      for (const page of cache.pages || []) {
+        const index = Number(page.index ?? page.pageIndex);
+        if (!Number.isInteger(index) || !state.images[index]) continue;
+        const cached = await sendRuntimeMessage({
+          action: 'getMangaCachedImage',
+          taskId: state.taskId,
+          pageIndex: index,
+          sourceUrl: state.sourceUrl,
+          outputFolder: state.taskOutputFolder,
+        });
+        if (!cached.success || !cached.data) continue;
+        const bytes = Uint8Array.from(atob(cached.data), character => character.charCodeAt(0));
+        const mimeType = cached.mimeType || 'image/png';
+        const blob = new Blob([bytes], { type: mimeType });
+        const item = state.images[index];
+        item.blob = blob;
+        item.resultUrl = URL.createObjectURL(blob);
+        item.resultDataUrl = `data:${mimeType};base64,${cached.data}`;
+        item.savedPath = page.path || '';
+        updateImageStatus(index, '已从本地缓存恢复译图', 'done');
+        restored += 1;
+      }
+      if (restored) {
+        downloadButton.disabled = false;
+        saveImagesButton.disabled = false;
+        setProgress(restored, state.images.length);
+        setStatus(`已从本地缓存恢复 ${restored} 张译图`, 'success');
+      }
+    } catch (error) {
+      setStatus(`读取本地译图缓存失败：${error.message}`, 'error');
+    }
+  }
+
+  async function showResumeTaskNotice() {
+    const stored = await storageGet(['mangaLastIndependentTask']);
+    const task = stored.mangaLastIndependentTask;
+    if (!task || Date.now() - Number(task.updatedAt || 0) > 30 * 24 * 60 * 60 * 1000 || task.taskId === state.taskId) return;
+    resumeTaskLabel.textContent = `${task.title || '未完成任务'} · ${task.count || 0} 张 · ${task.kind === 'files' ? '需要重新选择原图' : '可读取本地缓存'}`;
+    resumeTaskBox.hidden = false;
+    resumeTaskButton.onclick = async () => {
+      if (task.kind === 'files') {
+        state.pendingResumeRecord = task;
+        resumeTaskLabel.textContent = `${task.title || '未完成任务'} · 请重新选择并校验 ${task.count || 0} 张原图`;
+        imageFilesInput.click();
+        return;
+      }
+      else if (task.kind === 'html' && (task.imageUrls || []).length === task.count && task.imageUrls.every(Boolean)) {
+        state.pendingResumeRecord = task;
+        loadImageList(task.imageUrls, task.title, task.title, '', 'html', task.taskId);
+        state.pendingResumeRecord = null;
+        await restoreCachedResults();
+      } else if (task.kind === 'html') {
+        state.pendingResumeRecord = task;
+        resumeTaskLabel.textContent = `${task.title || '未完成任务'} · 请选择原章节 HTML 以验证图片列表`;
+        fileInput.click();
+        return;
+      }
+      else {
+        const urls = (task.imageUrls || []).filter(url => /^https?:\/\//i.test(url));
+        if (urls.length !== task.count) throw new Error('恢复信息中的远程图片地址不完整');
+        state.pendingResumeRecord = task;
+        loadImageList(urls, task.title, '', task.sourceUrl || '', 'web', task.taskId);
+        state.pendingResumeRecord = null;
+        await restoreCachedResults();
+      }
+      resumeTaskBox.hidden = true;
+    };
+  }
+
+  $('#cancel-resume-task').addEventListener('click', () => {
+    state.pendingResumeRecord = null;
+    resumeTaskBox.hidden = true;
+    setStatus('已取消任务恢复；可以导入新的图片或 HTML', 'info');
+  });
 
   async function reloadBackendConfig(endpoint) {
     const response = await fetch(`${endpoint}/reload_config`, {
@@ -601,6 +1017,7 @@
   function setAigateStatus(message, kind = 'info') {
     aigateStatus.textContent = message;
     aigateStatus.dataset.kind = kind;
+    if (aigateEndpointDisplay) aigateEndpointDisplay.textContent = `云端服务地址：${state.aigateEndpoint || '未启动'}`;
   }
 
   function normalizeAigateEndpoint(value) {
@@ -620,8 +1037,8 @@
       || info?.protocol !== SHARED_BACKEND_PROTOCOL) {
       throw new Error('HTTP 6006 已响应，但共享翻译服务身份或协议不匹配');
     }
-    if (!(Number(info?.configApiVersion) >= 1)) {
-      throw new Error('云端进程可达，但缺少统一配置 API v1；请更新项目并重启服务进程');
+    if (!(Number(info?.configApiVersion) >= 2)) {
+      throw new Error('云端进程可达，但缺少插件会话配置 API v2；请更新项目并重启服务进程');
     }
     return info;
   }
@@ -729,7 +1146,9 @@
       || state.creatingAigateInstance
       || state.startingAigateTranslation
       || state.checkingAigateConnectivity
-      || state.stoppingAigateInstance;
+      || state.stoppingAigateInstance
+      || state.releasingAigateInstance
+      || state.running || state.paused || state.externalTaskActive;
     const skus = state.aigateSkus;
     setSelectOptions(
       aigateSkuInput,
@@ -762,7 +1181,7 @@
     }
 
     const instances = state.aigateInstances.filter(item =>
-      item.areaName === state.aigateArea && item.operationStatus !== '4');
+      item.areaName === state.aigateArea && item.operationStatus !== '4' && !state.releasedAigateInstanceIds.has(item.instanceId));
     setSelectOptions(
       aigateInstanceInput,
       instances,
@@ -785,6 +1204,10 @@
     aigateTokenInput.disabled = lifecycleBusy;
     aigateAreaInput.disabled = lifecycleBusy;
     backendModeInput.disabled = lifecycleBusy;
+    outputFolderInput.disabled = lifecycleBusy;
+    chooseOutputFolderButton.disabled = lifecycleBusy;
+    startBackendButton.disabled = lifecycleBusy;
+    testButton.disabled = lifecycleBusy;
     aigateSkuInput.disabled = lifecycleBusy || !skus.length;
     aigateImageInput.disabled = lifecycleBusy || !images.length;
     aigateInstanceInput.disabled = lifecycleBusy || !instances.length;
@@ -797,6 +1220,7 @@
       || !state.aigateToken
       || !state.aigateInstanceId;
     stopAigateButton.disabled = lifecycleBusy || !state.aigateInstanceId;
+    releaseAigateButton.disabled = lifecycleBusy || !state.aigateToken || !state.aigateInstanceId;
     startAigateButton.title = '本机先从个人 GitHub 同步默认分支，再通过 SSH 隧道让云端 git pull，之后启动 GPU 翻译服务';
     checkAigateServiceButton.title = '只检查已运行实例的仓库版本、GPU 环境和 HTTP 6006 连通性，不启动实例或拉取代码';
   }
@@ -804,6 +1228,9 @@
   function renderBackendMode() {
     state.backendMode = backendModeInput.value === 'aigate' ? 'aigate' : 'local';
     aigateControls.hidden = state.backendMode !== 'aigate';
+    if (state.view === 'plugin') $('#source-panel-title').textContent = '本地服务与结果保存';
+    const savedSummary = state.taskOutputFolder || state.outputFolder || '未设置（使用 App 当前输出目录）';
+    if (standaloneSummary) standaloneSummary.textContent = `后端：${state.backendMode === 'aigate' ? 'AIGate 云端' : '本地 App'} · 保存目录：${savedSummary}`;
     startBackendButton.textContent = state.backendMode === 'aigate'
       ? '启动本地结果保存桥' : '启动 App 核心桥接';
     testButton.textContent = state.backendMode === 'aigate'
@@ -819,6 +1246,7 @@
   async function initializeBackendSettings() {
     const saved = await storageGet([
       'mangaOutputFolder',
+      'batch_size',
       'mangaBackendMode',
       'mangaAigateToken',
       'mangaAigateArea',
@@ -830,6 +1258,8 @@
     ]);
     state.outputFolder = String(saved.mangaOutputFolder || '').trim();
     outputFolderInput.value = state.outputFolder;
+    state.batchSize = normalizePluginBatchSize(saved.batch_size);
+    pluginBatchSizeInput.value = String(state.batchSize);
     state.backendMode = saved.mangaBackendMode === 'aigate' ? 'aigate' : 'local';
     state.aigateToken = String(saved.mangaAigateToken || '');
     state.aigateArea = String(saved.mangaAigateArea || '华东一区');
@@ -843,8 +1273,11 @@
     aigateAreaInput.value = state.aigateArea;
     endpointInput.value = DEFAULT_ENDPOINT;
     renderBackendMode();
+    reportBackendStatus();
     resetBackendLogCursor();
-    if (state.backendMode === 'aigate' && state.aigateToken) {
+    if (state.view === 'standalone') await showResumeTaskNotice();
+    await probeLocalBridge();
+    if (state.view !== 'standalone' && state.backendMode === 'aigate' && state.aigateToken) {
       refreshAigateResources()
         .then(() => {
           if (state.aigateEndpoint && state.aigateNonce) {
@@ -856,15 +1289,31 @@
     }
   }
 
+  async function probeLocalBridge() {
+    try {
+      const response = await fetch(`${DEFAULT_ENDPOINT}/backend_info`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const info = await response.json();
+      state.localBridgeReady = info?.service === 'manga-translator-ui'
+        && info?.mode === 'shared'
+        && info?.protocol === SHARED_BACKEND_PROTOCOL
+        && info?.projectRoot === SHARED_BACKEND_PROJECT_ROOT;
+    } catch {
+      state.localBridgeReady = false;
+    }
+    if (state.backendMode === 'local') state.remoteServiceReady = state.localBridgeReady;
+    reportBackendStatus();
+  }
+
   async function refreshAigateResources() {
-    if (state.refreshingAigateResources) return;
+    if (state.refreshingAigateResources) return false;
     state.refreshingAigateResources = true;
     renderAigateResources();
     try {
       await persistAigateForm();
       if (!state.aigateToken) {
         setAigateStatus('请填写 AIGate Bearer Token', 'error');
-        return;
+        return false;
       }
       setAigateStatus('正在读取可用 GPU、个人镜像和实例…');
       const result = await nativeMessage({
@@ -879,8 +1328,10 @@
       renderAigateResources();
       await persistAigateForm();
       setAigateStatus(`已读取 ${state.aigateSkus.length} 个 GPU 规格、${state.aigateImages.length} 个个人镜像和 ${state.aigateInstances.length} 个实例`, 'success');
+      return true;
     } catch (error) {
       setAigateStatus(`读取云扉资源失败：${error.message || error}`, 'error');
+      return false;
     } finally {
       state.refreshingAigateResources = false;
       renderAigateResources();
@@ -888,6 +1339,7 @@
   }
 
   async function startAigateTranslation(instanceId) {
+    if (state.running || state.paused || state.externalTaskActive) return false;
     const selectedInstanceId = String(instanceId || state.aigateInstanceId || '').trim();
     await persistAigateForm();
     if (!state.aigateToken || !selectedInstanceId) {
@@ -928,19 +1380,16 @@
         mangaAigateEndpoint: state.aigateEndpoint,
         mangaAigateNonce: state.aigateNonce,
       });
-      const configResult = await sendRuntimeMessage({
-        action: 'applyMangaTranslatorConfig',
-        reloadLocalConfig: false,
-      });
-      if (!configResult.success || configResult.backend !== 'aigate') {
-        throw new Error(configResult.error || '云端 GPU 配置未确认应用');
-      }
       resetBackendLogCursor();
       const backendInfo = await fetchAigateBackendInfo(state.aigateEndpoint, state.aigateNonce);
+      state.remoteServiceReady = true;
+      reportBackendStatus();
       const syncStatus = result.sourceUpdated ? '已拉取新提交' : '仓库已是最新';
-      setAigateStatus(`${aigateGpuSummary(gpu)} 已就绪 · manga-translator-ui ${revision}（${syncStatus}），PyTorch/ONNX GPU 配置已应用；HTTP 6006 与配置 API v${backendInfo.configApiVersion} 正常`, 'success');
+      setAigateStatus(`${aigateGpuSummary(gpu)} 服务已就绪 · manga-translator-ui ${revision}（${syncStatus}）；HTTP 6006 与配置 API v${backendInfo.configApiVersion} 正常`, 'success');
       return true;
     } catch (error) {
+      state.remoteServiceReady = false;
+      reportBackendStatus();
       setAigateStatus(
         serviceStarted
           ? `云端进程已启动，但页面连通性确认或状态保存失败：${error.message || error}。可点击“检查连通性”重试`
@@ -958,6 +1407,7 @@
   }
 
   async function checkAigateServiceConnectivity({ automatic = false } = {}) {
+    if (!automatic && (state.running || state.paused || state.externalTaskActive)) return false;
     let endpoint = state.aigateEndpoint;
     let nonce = state.aigateNonce;
     if (!state.aigateToken || !state.aigateInstanceId) {
@@ -985,17 +1435,14 @@
         mangaAigateNonce: nonce,
       });
       const info = await fetchAigateBackendInfo(endpoint, nonce);
-      const configResult = await sendRuntimeMessage({
-        action: 'applyMangaTranslatorConfig',
-        reloadLocalConfig: false,
-      });
-      if (!configResult.success || configResult.backend !== 'aigate') {
-        throw new Error(configResult.error || '云端 GPU 配置未确认应用');
-      }
+      state.remoteServiceReady = true;
+      reportBackendStatus();
       const revision = String(result.revision || '').trim();
-      setAigateStatus(`${aigateGpuSummary(gpu)} 已就绪 · 云端代码 ${revision || '版本未知'}，GPU 配置已应用 · HTTP 6006 与配置 API v${info.configApiVersion} 正常`, 'success');
+      setAigateStatus(`${aigateGpuSummary(gpu)} 翻译服务已就绪 · 云端代码 ${revision || '版本未知'} · HTTP 6006 与配置 API v${info.configApiVersion} 正常`, 'success');
       return true;
     } catch (error) {
+      state.remoteServiceReady = false;
+      reportBackendStatus();
       setAigateStatus(`云端服务连通性检查失败：${error.message || error}`, 'error');
       return false;
     } finally {
@@ -1005,7 +1452,7 @@
   }
 
   async function createAigateInstance() {
-    if (state.creatingAigateInstance) return;
+    if (state.creatingAigateInstance || state.running || state.paused || state.externalTaskActive) return;
     state.creatingAigateInstance = true;
     renderAigateResources();
     try {
@@ -1069,9 +1516,12 @@
       || state.creatingAigateInstance
       || state.startingAigateTranslation
       || state.checkingAigateConnectivity
-      || state.stoppingAigateInstance) return;
+      || state.stoppingAigateInstance
+      || state.releasingAigateInstance
+      || state.running || state.paused || state.externalTaskActive) return;
     const instanceId = String(aigateInstanceInput.value || state.aigateInstanceId || '').trim();
     if (!state.aigateToken || !instanceId) return;
+    if (!window.confirm(`关闭实例 ${instanceId}？实例会停止，但仍保留在云扉账户中，可稍后重新启动。`)) return;
     state.stoppingAigateInstance = true;
     renderAigateResources();
     try {
@@ -1084,14 +1534,53 @@
       if (!result.success) throw new Error(result.error || '停止云扉实例失败');
       state.aigateEndpoint = '';
       state.aigateNonce = '';
+      state.remoteServiceReady = false;
       await storageSet({ mangaAigateEndpoint: '', mangaAigateNonce: '' });
       setAigateStatus(`已请求停止实例 ${instanceId}；共享盘数据保留`, 'success');
-      await refreshAigateResources();
+      reportBackendStatus();
+      const refreshed = await refreshAigateResources();
+      setAigateStatus(refreshed
+        ? `已请求停止实例 ${instanceId}；实例仍保留，可稍后启动`
+        : `已请求停止实例 ${instanceId}；资源列表刷新失败，请稍后重试`, refreshed ? 'success' : 'info');
     } catch (error) {
       setAigateStatus(`停止云扉实例失败：${error.message || error}`, 'error');
     } finally {
       state.stoppingAigateInstance = false;
       renderAigateResources();
+    }
+  }
+
+  async function releaseAigateInstance() {
+    if (state.running || state.paused || state.externalTaskActive || state.refreshingAigateResources
+      || state.creatingAigateInstance || state.startingAigateTranslation || state.checkingAigateConnectivity
+      || state.stoppingAigateInstance || state.releasingAigateInstance) return;
+    const instanceId = String(aigateInstanceInput.value || state.aigateInstanceId || '').trim();
+    if (!state.aigateToken || !instanceId) return;
+    if (!window.confirm(`释放实例 ${instanceId}？此操作会删除该实例，无法通过启动操作恢复。`)) return;
+    state.releasingAigateInstance = true;
+    renderAigateResources();
+    setAigateStatus(`正在释放实例 ${instanceId}…`);
+    try {
+      const result = await nativeMessage({ action: 'aigateReleaseInstance', token: state.aigateToken, instanceId });
+      if (!result.success) throw new Error(result.error || '释放云扉实例失败');
+      state.aigateInstanceId = '';
+      state.aigateEndpoint = '';
+      state.aigateNonce = '';
+      state.remoteServiceReady = false;
+      state.releasedAigateInstanceIds.add(instanceId);
+      await storageSet({ mangaAigateInstanceId: '', mangaAigateEndpoint: '', mangaAigateNonce: '' });
+      const refreshed = await refreshAigateResources();
+      setAigateStatus(refreshed
+        ? `实例 ${instanceId} 已释放，资源列表已更新`
+        : `实例 ${instanceId} 已释放；资源列表刷新失败，请稍后重新读取`, refreshed ? 'success' : 'info');
+      if (state.aigateInstanceId === instanceId) state.aigateInstanceId = '';
+      await storageSet({ mangaAigateInstanceId: state.aigateInstanceId });
+    } catch (error) {
+      setAigateStatus(`释放实例失败，保留当前实例选择：${error.message || error}`, 'error');
+    } finally {
+      state.releasingAigateInstance = false;
+      renderAigateResources();
+      reportBackendStatus();
     }
   }
 
@@ -1112,14 +1601,15 @@
       } catch {
         localReady = false;
       }
-      if (!localReady && !(await startBackend({ silent: true }))) return false;
+      state.localBridgeReady = localReady;
+      if (!localReady) throw new Error('本地保存桥未运行；请使用插件配置页的“启动本地服务”后重试');
 
       if (mode === 'local') {
-        await reloadBackendConfig(localEndpoint);
+        state.remoteServiceReady = true;
+        reportBackendStatus();
         return { mode, endpoint: localEndpoint, nonce: '' };
       }
 
-      await reloadBackendConfig(localEndpoint);
       const saved = await storageGet(['mangaAigateEndpoint', 'mangaAigateNonce']);
       let remoteEndpoint;
       try {
@@ -1130,8 +1620,12 @@
       const nonce = String(saved.mangaAigateNonce || '').trim();
       if (nonce.length < 24) throw new Error('AIGate 服务凭据已失效，请重新启动云端服务');
       await fetchAigateBackendInfo(remoteEndpoint, nonce);
+      state.remoteServiceReady = true;
+      reportBackendStatus();
       return { mode, endpoint: remoteEndpoint, nonce };
     } catch (error) {
+      if (mode === 'aigate') state.remoteServiceReady = false;
+      reportBackendStatus();
       setStatus(`${mode === 'aigate' ? 'AIGate 云端' : '本地'}翻译后端不可用：${error.message}`, 'error');
       return false;
     }
@@ -1140,18 +1634,22 @@
   function loadCurrentPageData() {
     const encoded = new URLSearchParams(window.location.search).get('pageData');
     if (!encoded) return;
+    resumeTaskBox.hidden = true;
     try {
       const pageData = JSON.parse(encoded);
       const urls = Array.isArray(pageData.imageUrls)
         ? pageData.imageUrls.filter(url => typeof url === 'string' && /^https?:\/\//i.test(url))
         : [];
       if (!urls.length) throw new Error('当前网页没有可翻译图片');
-      loadImageList(urls, pageData.title || '当前网页章节', pageData.title || '当前网页', pageData.sourceUrl || '');
-      history.replaceState({}, document.title, chrome.runtime.getURL('manga/manga.html'));
+      loadImageList(urls, pageData.title || '当前网页章节', '当前网页', pageData.sourceUrl || '', 'web');
+      const cleanUrl = new URL(location.href);
+      cleanUrl.searchParams.delete('pageData');
+      history.replaceState({}, document.title, cleanUrl.href);
       if (pageData.autoStart === true) {
         setStatus(`已从当前网页读取 ${urls.length} 张图片，正在准备翻译…`, 'success');
         setTimeout(async () => {
           await state.outputFolderReady;
+          await state.cacheRestorePromise;
           if (state.running) return;
           translateButton.click();
         }, 80);
@@ -1163,8 +1661,12 @@
     }
   }
 
-  async function fetchImage(url) {
-    const response = await fetch(url, { credentials: 'omit', cache: 'no-store' });
+  async function fetchImage(item) {
+    if (item.sourceBlob instanceof Blob) {
+      if (!item.sourceBlob.size) throw new Error('本地图片文件为空');
+      return item.sourceBlob;
+    }
+    const response = await fetch(item.url, { credentials: 'omit', cache: 'no-store' });
     if (!response.ok) throw new Error(`下载图片失败（HTTP ${response.status}）`);
     const blob = await response.blob();
     if (!blob.size) throw new Error('下载到空图片');
@@ -1183,7 +1685,7 @@
 
   async function translateImage(item, index, backend) {
     updateImageStatus(index, '下载原图…', 'processing');
-    const sourceBlob = await fetchImage(item.url);
+    const sourceBlob = await fetchImage(item);
     const image = arrayBufferToBase64(await sourceBlob.arrayBuffer());
 
     updateImageStatus(index, backend.mode === 'aigate'
@@ -1193,12 +1695,12 @@
       body: JSON.stringify({
         image,
         filename: item.name,
-        imageUrl: item.url,
+        imageUrl: item.imageUrl || item.url,
         taskId: state.taskId,
         pageIndex: index,
         sourceUrl: state.sourceUrl,
         outputFolder: backend.mode === 'local'
-          ? (state.outputFolder || undefined)
+          ? (state.taskOutputFolder || state.outputFolder || undefined)
           : AIGATE_TEMP_OUTPUT_FOLDER,
         configRevision: state.configRevision,
       }),
@@ -1224,9 +1726,9 @@
           body: JSON.stringify({
             image: item.resultDataUrl.split(',', 2)[1],
             filename: item.name,
-            imageUrl: item.url,
+            imageUrl: item.imageUrl || item.url,
             sourceUrl: state.sourceUrl,
-            outputFolder: state.outputFolder || undefined,
+            outputFolder: state.taskOutputFolder || state.outputFolder || undefined,
           }),
           headers: { 'Content-Type': 'application/json' },
           cache: 'no-store',
@@ -1234,14 +1736,83 @@
       );
       if (!saveResponse.ok) {
         const detail = await saveResponse.text();
+        item.pendingSave = true;
+        saveImagesButton.disabled = false;
+        $('#retry-save-images').hidden = false;
         throw new Error(`AIGate 已返回译图，但本地保存失败（HTTP ${saveResponse.status}）：${detail.slice(0, 160)}`);
       }
       const saved = await saveResponse.json();
       item.savedPath = saved.path || '';
+      item.pendingSave = false;
     }
+    item.saved = true;
     const card = imageGrid.querySelector(`[data-index="${index}"]`);
     card.querySelector('img').src = item.resultUrl;
-    updateImageStatus(index, backend.mode === 'aigate' ? '翻译完成并保存到本地' : '翻译完成', 'done');
+    updateImageStatus(index, backend.mode === 'aigate' ? '翻译完成并保存到本地' : '翻译完成，已写入保存目录', 'done');
+    saveImagesButton.disabled = false;
+    await saveIndependentTaskRecord(state.sourceKind);
+  }
+
+  async function retrySaveImages() {
+    const pending = state.images.map((item, index) => ({ item, index })).filter(({ item }) => item.pendingSave && item.resultDataUrl);
+    if (!pending.length) return;
+    try {
+      const infoResponse = await fetch(`${DEFAULT_ENDPOINT}/backend_info`, { cache: 'no-store' });
+      if (!infoResponse.ok) throw new Error(`HTTP ${infoResponse.status}`);
+      const info = await infoResponse.json();
+      if (info?.service !== 'manga-translator-ui' || info?.mode !== 'shared' || info?.protocol !== SHARED_BACKEND_PROTOCOL) {
+        throw new Error('本地共享保存服务身份不匹配');
+      }
+      state.localBridgeReady = true;
+      reportBackendStatus();
+    } catch (error) {
+      state.localBridgeReady = false;
+      reportBackendStatus();
+      setStatus(`本地保存桥不可用：${error.message}。请先启动本地服务后重试保存。`, 'error');
+      return;
+    }
+    for (const { item, index } of pending) {
+      updateImageStatus(index, '正在重试本地保存…', 'processing');
+      try {
+        const response = await fetch(`${DEFAULT_ENDPOINT}/cache/task/${encodeURIComponent(state.taskId)}/image/${index}`, {
+          method: 'POST',
+          body: JSON.stringify({
+            image: item.resultDataUrl.split(',', 2)[1],
+            filename: item.name,
+            imageUrl: item.imageUrl || item.url,
+            sourceUrl: state.sourceUrl,
+            outputFolder: state.taskOutputFolder || state.outputFolder || undefined,
+          }),
+          headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 140)}`);
+        const saved = await response.json();
+        item.savedPath = saved.path || '';
+        item.pendingSave = false;
+        item.saved = true;
+        updateImageStatus(index, '译图已保存到本地', 'done');
+      } catch (error) {
+        updateImageStatus(index, `待保存：${error.message || error}`, 'error');
+      }
+    }
+    const stillPending = state.images.some(item => item.pendingSave);
+    $('#retry-save-images').hidden = !stillPending;
+    setStatus(stillPending ? '仍有译图待保存，可再次重试' : '译图已保存到本地', stillPending ? 'error' : 'success');
+  }
+
+  function saveTranslatedImages() {
+    const results = state.images.filter(item => item.resultDataUrl);
+    if (!results.length) return;
+    for (const item of results) {
+      const anchor = document.createElement('a');
+      anchor.href = item.resultDataUrl;
+      anchor.download = `translated-${safeDownloadBaseName(item.name)}.png`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+    }
+    setStatus(`已发送 ${results.length} 张译图到浏览器下载`, 'success');
   }
 
   async function readStreamingImage(response, index) {
@@ -1336,9 +1907,20 @@
     });
   }
 
-  async function translateChapter() {
+  async function translateChapter({ retryFailed = false } = {}) {
     if (state.running || !state.images.length) return;
+    const indexes = state.images.map((item, index) => ({ item, index }))
+      .filter(({ item }) => retryFailed
+        ? item.status === 'error' && !item.pendingSave
+        : !item.resultDataUrl && !item.pendingSave)
+      .map(({ index }) => index);
+    if (!indexes.length) {
+      if (state.images.some(item => item.pendingSave)) setStatus('有已返回的译图等待保存，请使用“重试保存译图”', 'info');
+      else setStatus('所有图片均已有译图', 'success');
+      return;
+    }
     await state.outputFolderReady;
+    if (!state.taskOutputFolder) state.taskOutputFolder = state.outputFolder;
     const backend = await ensureBackendAvailable();
     if (!backend) return;
     try {
@@ -1359,12 +1941,15 @@
     testButton.disabled = true;
     startBackendButton.disabled = true;
     updatePauseButton();
-    downloadButton.disabled = true;
-    setProgress(0, state.images.length);
-      setStatus('开始处理章节…');
-    let completed = 0;
+    downloadButton.disabled = !state.images.some(item => item.resultDataUrl);
+    saveImagesButton.disabled = !state.images.some(item => item.resultDataUrl);
+    let completed = state.images.filter(item => item.resultDataUrl).length;
+    setProgress(completed, state.images.length);
+    setStatus(retryFailed ? `重试 ${indexes.length} 张失败图片…` : '开始处理图片…');
+    reportTaskStatus(true, completed, state.images.length);
+    renderAigateResources();
     try {
-      for (let index = 0; index < state.images.length; index += 1) {
+      for (const index of indexes) {
         while (state.paused && state.running) {
           await new Promise(resolve => setTimeout(resolve, 120));
         }
@@ -1376,10 +1961,16 @@
         }
         completed += 1;
         setProgress(completed, state.images.length);
+        reportTaskStatus(true, completed, state.images.length);
       }
       const successCount = state.images.filter(item => item.resultDataUrl).length;
       downloadButton.disabled = successCount === 0;
-      setStatus(`章节处理完成：${successCount} / ${state.images.length} 张成功`, successCount ? 'success' : 'error');
+      saveImagesButton.disabled = successCount === 0;
+      const missingCount = state.images.length - successCount;
+      const pendingCount = state.images.filter(item => item.pendingSave).length;
+      setStatus(`处理完成：${successCount} 张成功，${missingCount} 张缺失${pendingCount ? `，${pendingCount} 张待保存` : ''}`, successCount ? 'success' : 'error');
+      $('#retry-failed-images').hidden = !state.images.some(item => item.status === 'error' && !item.pendingSave);
+      $('#retry-save-images').hidden = pendingCount === 0;
     } finally {
       state.running = false;
       state.paused = false;
@@ -1387,6 +1978,9 @@
       testButton.disabled = false;
       startBackendButton.disabled = false;
       updatePauseButton();
+      renderAigateResources();
+      reportTaskStatus(false, state.images.filter(item => item.resultDataUrl).length, state.images.length);
+      await saveIndependentTaskRecord(state.sourceKind);
     }
   }
 
@@ -1394,8 +1988,10 @@
     if (!state.running) return;
     state.paused = !state.paused;
     updatePauseButton();
+    reportTaskStatus(true, Number(progressText.textContent.split('/')[0]) || 0, state.images.length);
+    renderAigateResources();
     if (state.paused) {
-      setStatus(`已暂停：${progressText.textContent}，当前图片完成后停止`, 'info');
+      setStatus(`正在完成当前图片；完成后暂停（${progressText.textContent}）`, 'info');
     } else {
       setStatus('继续处理章节…', 'success');
     }
@@ -1411,6 +2007,9 @@
         ? `AIGate 云端翻译服务和本地保存桥已连接：${backend.endpoint}`
         : '本地 App 核心桥接已连接', 'success');
     } catch (error) {
+      state.localBridgeReady = false;
+      state.remoteServiceReady = false;
+      reportBackendStatus();
       setStatus(`翻译后端连接失败：${error.message}`, 'error');
     } finally {
       testButton.disabled = false;
@@ -1418,7 +2017,7 @@
   }
 
   async function startBackend({ silent = false } = {}) {
-    if (state.running) return;
+    if (state.running || state.paused || state.externalTaskActive) return;
     let endpoint;
     try {
       endpoint = validateLoopbackEndpoint(endpointInput.value || DEFAULT_ENDPOINT);
@@ -1437,9 +2036,19 @@
         outputFolder: state.outputFolder || '',
       });
       if (!response.success) throw new Error(response.error || '本机启动器未能启动后端');
+      const infoResponse = await fetch(`${endpoint}/backend_info`, { cache: 'no-store' });
+      if (!infoResponse.ok) throw new Error(`启动请求已返回，但服务尚未就绪（HTTP ${infoResponse.status}）`);
+      const info = await infoResponse.json();
+      if (info?.service !== 'manga-translator-ui' || info?.mode !== 'shared' || info?.protocol !== SHARED_BACKEND_PROTOCOL) {
+        throw new Error('进程已响应，但不是预期的 manga-translator-ui 共享服务');
+      }
+      state.localBridgeReady = true;
       if (!silent) setStatus(response.alreadyRunning ? 'App 核心桥接已经在运行' : 'App 核心桥接已启动，可以开始翻译', 'success');
+      reportBackendStatus();
       return true;
     } catch (error) {
+      state.localBridgeReady = false;
+      reportBackendStatus();
       setStatus(`启动后端失败：${error.message}。请确认已运行 native-host/install-macos.sh。`, 'error');
       return false;
     } finally {
@@ -1471,6 +2080,7 @@
 
   fileInput.addEventListener('change', event => {
     const file = event.target.files?.[0];
+    event.target.value = '';
     if (file) loadChapter(file).catch(error => setStatus(`HTML 读取失败：${error.message}`, 'error'));
   });
   ['dragenter', 'dragover'].forEach(type => fileDrop.addEventListener(type, event => {
@@ -1485,12 +2095,73 @@
     const file = event.dataTransfer.files?.[0];
     if (file) loadChapter(file).catch(error => setStatus(`HTML 读取失败：${error.message}`, 'error'));
   });
+  chooseImagesButton.addEventListener('click', () => imageFilesInput.click());
+  chooseHtmlButton.addEventListener('click', () => fileInput.click());
+  imageFilesInput.addEventListener('change', event => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = '';
+    loadImageFiles(files).catch(error => setStatus(`图片导入失败：${error.message}`, 'error'));
+  });
+  document.body.addEventListener('dragover', event => {
+    if (event.dataTransfer?.types?.includes('Files')) event.preventDefault();
+  });
+  document.body.addEventListener('drop', event => {
+    if (event.target.closest?.('.file-drop')) return;
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (!files.length) return;
+    event.preventDefault();
+    if (files.every(file => /^image\/(png|jpeg|webp)$/i.test(file.type))) {
+      loadImageFiles(files).catch(error => setStatus(`图片导入失败：${error.message}`, 'error'));
+    } else {
+      const html = files.find(file => /\.html?$/i.test(file.name) || file.type === 'text/html');
+      if (html) loadChapter(html).catch(error => setStatus(`HTML 读取失败：${error.message}`, 'error'));
+      else setStatus('请拖入 PNG、JPEG、WebP 图片或漫画 HTML 文件', 'error');
+    }
+  });
   outputFolderInput.addEventListener('change', () => {
+    if (state.running || state.paused || state.externalTaskActive) {
+      outputFolderInput.value = state.outputFolder;
+      return;
+    }
     state.outputFolder = outputFolderInput.value.trim();
-    chrome.storage.local.set({ mangaOutputFolder: state.outputFolder });
+    storageSet({ mangaOutputFolder: state.outputFolder })
+      .then(async () => {
+        if (!state.taskOutputFolderFromResume) {
+          state.taskOutputFolder = state.outputFolder;
+          await saveIndependentTaskRecord(state.sourceKind);
+        }
+      })
+      .catch(error => setStatus(`保存目录设置失败：${error.message || error}`, 'error'));
+    renderBackendMode();
+  });
+  pluginBatchSizeInput.addEventListener('change', async () => {
+    const previous = state.batchSize;
+    const next = normalizePluginBatchSize(pluginBatchSizeInput.value, previous);
+    pluginBatchSizeInput.value = String(next);
+    pluginBatchSizeStatus.textContent = '保存中…';
+    pluginBatchSizeStatus.dataset.kind = 'info';
+    try {
+      await storageSet({ batch_size: next });
+      state.batchSize = next;
+      pluginBatchSizeStatus.textContent = '已保存到插件配置';
+      pluginBatchSizeStatus.dataset.kind = 'success';
+    } catch (error) {
+      pluginBatchSizeInput.value = String(previous);
+      pluginBatchSizeStatus.textContent = `保存失败：${error.message || error}`;
+      pluginBatchSizeStatus.dataset.kind = 'error';
+    }
   });
   backendModeInput.addEventListener('change', async () => {
+    if (state.running || state.paused || state.externalTaskActive) {
+      backendModeInput.value = state.backendMode;
+      return;
+    }
     renderBackendMode();
+    state.logSource = 'current';
+    logSourceInput.value = 'current';
+    state.localBridgeReady = false;
+    state.remoteServiceReady = false;
+    reportBackendStatus();
     resetBackendLogCursor();
     await storageSet({ mangaBackendMode: state.backendMode });
     if (state.backendMode === 'aigate' && state.aigateToken) await refreshAigateResources();
@@ -1513,6 +2184,10 @@
     await persistAigateForm();
   });
   aigateInstanceInput.addEventListener('change', async () => {
+    if (state.running || state.paused || state.externalTaskActive) {
+      aigateInstanceInput.value = state.aigateInstanceId;
+      return;
+    }
     const nextInstanceId = aigateInstanceInput.value;
     if (state.aigateInstanceId !== nextInstanceId) {
       state.aigateEndpoint = '';
@@ -1528,6 +2203,7 @@
   startAigateButton.addEventListener('click', () => startAigateTranslation());
   checkAigateServiceButton.addEventListener('click', () => checkAigateServiceConnectivity());
   stopAigateButton.addEventListener('click', stopAigateInstance);
+  releaseAigateButton.addEventListener('click', releaseAigateInstance);
   chooseOutputFolderButton.addEventListener('click', async () => {
     chooseOutputFolderButton.disabled = true;
     try {
@@ -1555,7 +2231,81 @@
   startBackendButton.addEventListener('click', startBackend);
   pauseTranslationButton.addEventListener('click', togglePause);
   translateButton.addEventListener('click', translateChapter);
+  retryFailedButton.addEventListener('click', () => translateChapter({ retryFailed: true }));
+  $('#retry-save-images').addEventListener('click', retrySaveImages);
+  saveImagesButton.addEventListener('click', saveTranslatedImages);
   downloadButton.addEventListener('click', downloadTranslatedHtml);
+  chrome.storage.onChanged?.addListener((changes, areaName) => {
+    if (areaName !== 'local') return;
+    if (changes.batch_size) {
+      state.batchSize = normalizePluginBatchSize(changes.batch_size.newValue);
+      pluginBatchSizeInput.value = String(state.batchSize);
+    }
+    if (state.running || state.paused || state.externalTaskActive) return;
+    let backendChanged = false;
+    if (changes.mangaBackendMode) {
+      const nextMode = changes.mangaBackendMode.newValue === 'aigate' ? 'aigate' : 'local';
+      if (nextMode !== state.backendMode) {
+        state.backendMode = nextMode;
+        backendModeInput.value = nextMode;
+        state.remoteServiceReady = false;
+        state.logSource = 'current';
+        logSourceInput.value = 'current';
+        resetBackendLogCursor();
+        backendChanged = true;
+      }
+    }
+    if (changes.mangaOutputFolder) {
+      state.outputFolder = String(changes.mangaOutputFolder.newValue || '').trim();
+      outputFolderInput.value = state.outputFolder;
+      if (!state.taskOutputFolderFromResume) {
+        state.taskOutputFolder = state.outputFolder;
+        saveIndependentTaskRecord(state.sourceKind).catch(error => setStatus(`更新任务保存目录失败：${error.message || error}`, 'error'));
+      }
+    }
+    if (changes.mangaAigateToken) {
+      state.aigateToken = String(changes.mangaAigateToken.newValue || '');
+      aigateTokenInput.value = state.aigateToken;
+    }
+    if (changes.mangaAigateArea) {
+      state.aigateArea = String(changes.mangaAigateArea.newValue || '华东一区');
+      aigateAreaInput.value = state.aigateArea;
+    }
+    if (changes.mangaAigateSkuName) state.aigateSkuName = String(changes.mangaAigateSkuName.newValue || '');
+    if (changes.mangaAigateImageId) state.aigateImageId = String(changes.mangaAigateImageId.newValue || '');
+    if (changes.mangaAigateInstanceId) {
+      state.aigateInstanceId = String(changes.mangaAigateInstanceId.newValue || '');
+      backendChanged = true;
+    }
+    if (changes.mangaAigateEndpoint) {
+      state.aigateEndpoint = String(changes.mangaAigateEndpoint.newValue || '');
+      state.remoteServiceReady = false;
+      backendChanged = true;
+    }
+    if (changes.mangaAigateNonce) {
+      state.aigateNonce = String(changes.mangaAigateNonce.newValue || '');
+      state.remoteServiceReady = false;
+      backendChanged = true;
+    }
+    renderBackendMode();
+    renderAigateResources();
+    if (backendChanged) {
+      reportBackendStatus();
+      if (state.backendMode === 'aigate' && state.view !== 'standalone') resetBackendLogCursor();
+    }
+  });
+  document.querySelectorAll('[data-preview-mode]').forEach(button => button.addEventListener('click', () => {
+    state.previewMode = button.dataset.previewMode;
+    if (state.selectedImageIndex >= 0) selectPreviewImage(state.selectedImageIndex);
+  }));
+  logSourceInput.addEventListener('change', () => {
+    state.logSource = logSourceInput.value === 'local' ? 'local' : 'current';
+    resetBackendLogCursor();
+  });
+  pauseBackendLogButton.addEventListener('click', () => {
+    state.logScrollPaused = !state.logScrollPaused;
+    pauseBackendLogButton.textContent = state.logScrollPaused ? '恢复自动滚动' : '暂停滚动';
+  });
   clearBackendLogButton.addEventListener('click', () => {
     backendLog.textContent = '';
   });
@@ -1563,6 +2313,18 @@
     const collapsed = logsPanel.dataset.collapsed === 'true';
     logsPanel.dataset.collapsed = collapsed ? 'false' : 'true';
     toggleBackendLogButton.textContent = collapsed ? '隐藏日志' : '显示日志';
+  });
+  window.addEventListener('message', event => {
+    if (event.origin !== location.origin || !event.data) return;
+    if (event.data.type === 'workbenchVisibility') {
+      state.workbenchVisible = Boolean(event.data.visible);
+      if (state.workbenchVisible) pollBackendLog();
+    } else if (event.data.type === 'workbenchTheme') {
+      document.documentElement.dataset.theme = event.data.theme === 'light' ? 'light' : 'dark';
+    } else if (event.data.type === 'workbenchTaskStatus') {
+      state.externalTaskActive = Boolean(event.data.active && state.view !== 'standalone');
+      renderAigateResources();
+    }
   });
   endpointInput.value = DEFAULT_ENDPOINT;
   state.outputFolderReady = initializeBackendSettings().catch(error => {
@@ -1574,6 +2336,6 @@
   });
   updatePauseButton();
   setProgress(0, 0);
-  startBackendLogPolling();
+  if (state.view !== 'standalone') startBackendLogPolling();
   loadCurrentPageData();
 })();

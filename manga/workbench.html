@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>漫画翻译工作台</title>
+  <link rel="stylesheet" href="workbench.css">
+</head>
+<body>
+  <div class="workbench">
+    <header class="app-header">
+      <a class="brand" href="#plugin-config" aria-label="漫画翻译工作台首页">
+        <span class="brand-mark" aria-hidden="true">漫</span>
+        <span>漫画翻译</span>
+      </a>
+      <nav class="primary-nav" aria-label="主导航">
+        <a href="#plugin-config" data-route="plugin-config">插件配置</a>
+        <a href="#manga-config" data-route="manga-config">漫画翻译配置</a>
+        <a href="#standalone" data-route="standalone">独立翻译</a>
+      </nav>
+      <div class="header-state" id="header-state"><span class="status-dot"></span><span>正在读取状态</span></div>
+      <button class="theme-toggle" id="theme-toggle" type="button" aria-label="切换浅色主题">浅色</button>
+    </header>
+
+    <main class="workspace">
+      <section class="workspace-page" data-page="plugin-config" aria-label="插件配置">
+        <iframe title="插件配置与后端服务" src="manga.html?view=plugin"></iframe>
+      </section>
+      <section class="workspace-page" data-page="manga-config" aria-label="漫画翻译配置" hidden>
+        <iframe title="漫画翻译参数" src="config.html?embedded=1"></iframe>
+      </section>
+      <section class="workspace-page" data-page="standalone" aria-label="独立翻译" hidden>
+        <iframe title="图片与漫画 HTML 翻译" id="standalone-frame"></iframe>
+      </section>
+    </main>
+
+    <aside class="task-return" id="task-return" hidden aria-live="polite">
+      <span class="status-dot running"></span>
+      <span id="task-summary">独立任务进行中</span>
+      <button id="return-to-task" type="button">返回任务</button>
+    </aside>
+  </div>
+  <script src="workbench.js"></script>
+</body>
+</html>

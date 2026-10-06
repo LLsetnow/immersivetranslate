@@ -264,9 +264,13 @@ const MANGA_BACKEND_PROJECT_ROOT = '/Users/apple/Documents/github/manga-translat
 const MANGA_AIGATE_TEMP_OUTPUT_FOLDER = '/tmp/immersive-translate-output';
 const MANGA_BACKEND_READY_TTL_MS = 30000;
 const MANGA_BATCH_WINDOW_SIZE = 10;
+const MANGA_DEFAULT_BATCH_SIZE = 10;
 let mangaBackendReadyUntil = 0;
 let mangaBackendProbePromise = null;
+let mangaBackendPageProgressVersion = 0;
 let mangaAigateReadyUntil = 0;
+let mangaAigateReadyEndpoint = '';
+let mangaAigatePageProgressVersion = 0;
 const MANGA_NATIVE_HOST_NAME = 'com.timecyber.immersivetranslate.manga_backend';
 
 function sendNativeMessage(message) {
@@ -281,8 +285,8 @@ function sendNativeMessage(message) {
   });
 }
 
-async function mangaBackendReady() {
-  if (Date.now() < mangaBackendReadyUntil) return true;
+async function mangaBackendReady(force = false) {
+  if (!force && Date.now() < mangaBackendReadyUntil) return true;
   if (mangaBackendProbePromise) return mangaBackendProbePromise;
   mangaBackendProbePromise = (async () => {
     try {
@@ -292,9 +296,12 @@ async function mangaBackendReady() {
       const ready = info?.service === 'manga-translator-ui'
         && info?.mode === 'shared'
         && info?.protocol === MANGA_BACKEND_PROTOCOL
-        && Number(info?.configApiVersion) >= 1
+        && Number(info?.configApiVersion) >= 2
         && info?.projectRoot === MANGA_BACKEND_PROJECT_ROOT;
-      if (ready) mangaBackendReadyUntil = Date.now() + MANGA_BACKEND_READY_TTL_MS;
+      if (ready) {
+        mangaBackendReadyUntil = Date.now() + MANGA_BACKEND_READY_TTL_MS;
+        mangaBackendPageProgressVersion = Number(info?.pageProgressVersion) || 0;
+      }
       return ready;
     } catch {
       return false;
@@ -316,7 +323,10 @@ async function ensureMangaBackend(outputFolder = '') {
   if (!response.success) {
     throw new Error(response.error || '本地翻译后端启动失败');
   }
-  mangaBackendReadyUntil = Date.now() + MANGA_BACKEND_READY_TTL_MS;
+  mangaBackendReadyUntil = 0;
+  if (!(await mangaBackendReady(true))) {
+    throw new Error('本地翻译后端已启动，但共享接口尚未就绪');
+  }
 }
 
 async function reloadMangaBackendConfig() {
@@ -365,11 +375,23 @@ async function ensureMangaTranslationBackend(outputFolder = '', options = {}) {
   await ensureMangaBackend(outputFolder);
   const backend = await getMangaTranslationBackend();
   if (backend.mode === 'local') {
+    if (options.verifyCloud && !(await mangaBackendReady(true))) {
+      mangaBackendReadyUntil = 0;
+      await ensureMangaBackend(outputFolder);
+      if (!(await mangaBackendReady(true))) throw new Error('本地翻译后端共享接口不可用');
+    }
     if (options.reloadLocalConfig) await reloadMangaBackendConfig();
-    return backend;
+    return { ...backend, pageProgressVersion: mangaBackendPageProgressVersion };
   }
   if (options.reloadLocalConfig) await reloadMangaBackendConfig();
-  if (!options.verifyCloud && Date.now() < mangaAigateReadyUntil) return backend;
+  if (mangaAigateReadyEndpoint !== backend.endpoint) {
+    mangaAigateReadyUntil = 0;
+    mangaAigatePageProgressVersion = 0;
+    mangaAigateReadyEndpoint = backend.endpoint;
+  }
+  if (!options.verifyCloud && Date.now() < mangaAigateReadyUntil) {
+    return { ...backend, pageProgressVersion: mangaAigatePageProgressVersion };
+  }
   mangaAigateReadyUntil = 0;
 
   let response;
@@ -386,11 +408,12 @@ async function ensureMangaTranslationBackend(outputFolder = '', options = {}) {
   if (info?.service !== 'manga-translator-ui'
     || info?.mode !== 'shared'
     || info?.protocol !== MANGA_BACKEND_PROTOCOL
-    || !(Number(info?.configApiVersion) >= 1)) {
-    throw new Error('AIGate 实例未运行支持统一配置的 manga-translator-ui 共享服务；请更新云端项目后重启服务');
+    || !(Number(info?.configApiVersion) >= 2)) {
+    throw new Error('AIGate 实例未运行支持插件会话配置 API v2 的 manga-translator-ui 共享服务；请更新云端项目后重启服务');
   }
   mangaAigateReadyUntil = Date.now() + MANGA_BACKEND_READY_TTL_MS;
-  return backend;
+  mangaAigatePageProgressVersion = Number(info?.pageProgressVersion) || 0;
+  return { ...backend, pageProgressVersion: mangaAigatePageProgressVersion };
 }
 
 async function saveMangaTranslationLocally({
@@ -456,6 +479,25 @@ async function getMangaTranslatorConfig() {
   return response.config;
 }
 
+async function waitForMangaBackendIdle(backend, deadline) {
+  let lastStatus = null;
+  while (Date.now() < deadline) {
+    const response = await fetch(`${backend.endpoint}/is_locked`, {
+      headers: backend.mode === 'aigate' ? { 'X-Nonce': backend.nonce } : {},
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      throw new Error(`读取翻译后端忙闲状态失败（HTTP ${response.status}）`);
+    }
+    lastStatus = await response.json();
+    if (!lastStatus.locked && !(Number(lastStatus.queued) > 0)) return;
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+
+  const activeJob = lastStatus?.activeJob ? `，当前任务：${lastStatus.activeJob}` : '';
+  throw new Error(`等待翻译后端空闲超时${activeJob}`);
+}
+
 async function applyMangaTranslatorConfig(backend) {
   const savedConfig = await getMangaTranslatorConfig();
   // Cloud translation must not inherit a local CPU-only preference. Keep the
@@ -471,16 +513,46 @@ async function applyMangaTranslatorConfig(backend) {
     config.cli.disable_onnx_gpu = false;
   }
   let response;
+  const applyDeadline = Date.now() + 10 * 60 * 1000;
+  let busyRetries = 0;
+  let gatewayTimeoutRetried = false;
   try {
-    response = await fetch(`${backend.endpoint}/config/apply`, {
-      method: 'POST',
-      body: JSON.stringify({ config }),
-      headers: {
-        'Content-Type': 'application/json',
-        ...(backend.mode === 'aigate' ? { 'X-Nonce': backend.nonce } : {}),
-      },
+    const infoResponse = await fetch(`${backend.endpoint}/backend_info`, {
+      headers: backend.mode === 'aigate' ? { 'X-Nonce': backend.nonce } : {},
       cache: 'no-store',
     });
+    if (!infoResponse.ok) {
+      throw new Error(`读取服务能力失败（HTTP ${infoResponse.status}）`);
+    }
+    const backendInfo = await infoResponse.json();
+    if (Number(backendInfo?.configApiVersion) < 2) {
+      throw new Error('当前翻译服务不支持插件独立配置，会写入 App config.json；请更新 manga-translator-ui 并重启共享服务');
+    }
+    backend.pageProgressVersion = Number(backendInfo?.pageProgressVersion) || 0;
+    if (backend.mode === 'aigate') {
+      mangaAigatePageProgressVersion = backend.pageProgressVersion;
+      mangaAigateReadyEndpoint = backend.endpoint;
+    } else {
+      mangaBackendPageProgressVersion = backend.pageProgressVersion;
+    }
+    while (true) {
+      response = await fetch(`${backend.endpoint}/config/apply`, {
+        method: 'POST',
+        body: JSON.stringify({ config, persist: false }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...(backend.mode === 'aigate' ? { 'X-Nonce': backend.nonce } : {}),
+        },
+        cache: 'no-store',
+      });
+      const shouldWaitForIdle = response.status === 409
+        || (response.status === 504 && !gatewayTimeoutRetried);
+      if (!shouldWaitForIdle) break;
+      if (response.status === 409) busyRetries += 1;
+      else gatewayTimeoutRetried = true;
+      if (Date.now() >= applyDeadline || busyRetries > 20) break;
+      await waitForMangaBackendIdle(backend, applyDeadline);
+    }
   } catch (error) {
     throw new Error(`发送漫画翻译配置失败：${error.message || error}`);
   }
@@ -510,9 +582,9 @@ async function rememberMangaTask(sourceUrl, taskId, imageCount) {
   await storageSet({ mangaTaskMap: Object.fromEntries(recent) });
 }
 
-async function getMangaCache(taskId, sourceUrl, imageUrls) {
+async function getMangaCache(taskId, sourceUrl, imageUrls, requestedOutputFolder = '') {
   if (!taskId) return { success: true, found: false, pages: [] };
-  const outputFolder = await getMangaOutputFolder();
+  const outputFolder = String(requestedOutputFolder || await getMangaOutputFolder()).trim();
   const sourceKey = normaliseMangaSourceUrl(sourceUrl);
   const stored = await storageGet(['mangaTaskMap']);
   const existingTask = stored.mangaTaskMap?.[sourceKey]?.taskId || '';
@@ -557,8 +629,8 @@ async function getMangaCache(taskId, sourceUrl, imageUrls) {
   };
 }
 
-async function getMangaCachedImage(taskId, pageIndex, sourceUrl = '') {
-  const outputFolder = await getMangaOutputFolder();
+async function getMangaCachedImage(taskId, pageIndex, sourceUrl = '', requestedOutputFolder = '') {
+  const outputFolder = String(requestedOutputFolder || await getMangaOutputFolder()).trim();
   await ensureMangaBackend(outputFolder);
   const query = new URLSearchParams({
     outputFolder,
@@ -716,6 +788,9 @@ function postMangaBatchMessage(port, message) {
 
 function postMangaBatchEvent(port, event) {
   if (!port) return false;
+  if (event.type === 'page-progress') {
+    return postMangaBatchMessage(port, { action: 'mangaBatchPageProgress', ...event });
+  }
   if (event.type === 'result') {
     return postMangaBatchMessage(port, {
       action: 'mangaBatchImage',
@@ -736,28 +811,63 @@ function postMangaBatchEvent(port, event) {
   return true;
 }
 
-async function translateMangaBatchInBackground(entries, sourceUrl, taskId, batchSize, port) {
+async function translateMangaBatchInBackground(entries, sourceUrl, taskId, runId, port) {
   if (entries.length > MANGA_BATCH_WINDOW_SIZE) {
     throw new Error(`单次批量翻译最多支持 ${MANGA_BATCH_WINDOW_SIZE} 张图片`);
   }
   const outputFolder = await getMangaOutputFolder();
   await rememberMangaTask(sourceUrl, taskId, entries.length);
-  const backend = await ensureMangaTranslationBackend(outputFolder, { reloadLocalConfig: true });
+  const backend = await ensureMangaTranslationBackend(outputFolder, { reloadLocalConfig: false });
   const appliedConfig = await applyMangaTranslatorConfig(backend);
+  let progressSequence = 0;
+  const pageIndexes = new Set(entries.map(entry => Number(entry.pageIndex)));
+  const postEvent = event => postMangaBatchEvent(port, {
+    ...event,
+    taskId,
+    runId,
+  });
+  const emitPageProgress = (pageIndex, stage, state, step = '', error = '', backendSequence) => {
+    const index = Number(pageIndex);
+    if (!pageIndexes.has(index)) return true;
+    progressSequence += 1;
+    return postEvent({
+      type: 'page-progress',
+      pageIndex: index,
+      stage,
+      state,
+      step,
+      sequence: progressSequence,
+      ...(Number.isInteger(Number(backendSequence)) ? { backendSequence: Number(backendSequence) } : {}),
+      ...(error ? { error: String(error).slice(0, 600) } : {}),
+    });
+  };
+
+  if (!postMangaBatchMessage(port, {
+    action: 'mangaBatchStarted',
+    taskId,
+    runId,
+    backend: backend.mode,
+    pageProgressVersion: backend.pageProgressVersion || 0,
+  })) {
+    throw new Error('漫画翻译页面已离开，停止回传批量结果');
+  }
 
   const fetched = await Promise.all(entries.map(async entry => {
+    emitPageProgress(entry.pageIndex, 'prepare', 'running', 'download');
     try {
       if (!/^https?:\/\//i.test(entry.url)) throw new Error('图片地址不是 HTTP/HTTPS');
       const response = await fetch(entry.url, { credentials: 'omit', cache: 'no-store' });
       if (!response.ok) throw new Error(`下载原图失败（HTTP ${response.status}）`);
       const blob = await response.blob();
       if (!blob.size) throw new Error('下载到空图片');
+      emitPageProgress(entry.pageIndex, 'prepare', 'running', 'submit');
       return {
         ok: true,
         entry,
         image: arrayBufferToBase64(await blob.arrayBuffer()),
       };
     } catch (error) {
+      emitPageProgress(entry.pageIndex, 'prepare', 'error', 'download', error.message || String(error));
       return { ok: false, entry, error: error.message || String(error) };
     }
   }));
@@ -772,9 +882,8 @@ async function translateMangaBatchInBackground(entries, sourceUrl, taskId, batch
         pageIndex: item.entry.pageIndex,
       });
     } else {
-      if (!postMangaBatchEvent(port, {
+      if (!postEvent({
         type: 'error',
-        taskId,
         pageIndex: item.entry.pageIndex,
         filename: item.entry.filename,
         error: item.error,
@@ -786,9 +895,8 @@ async function translateMangaBatchInBackground(entries, sourceUrl, taskId, batch
   });
 
   if (!validEntries.length) {
-    if (!postMangaBatchEvent(port, {
+    if (!postEvent({
       type: 'done',
-      taskId,
       success: false,
       processed: 0,
       total: entries.length,
@@ -798,59 +906,97 @@ async function translateMangaBatchInBackground(entries, sourceUrl, taskId, batch
     return;
   }
 
-  const response = await fetch(`${backend.endpoint}/execute_image/batch_translate`, {
-    method: 'POST',
-    body: JSON.stringify({
-      images: validEntries,
-      taskId,
-      sourceUrl: normaliseMangaSourceUrl(sourceUrl),
-      outputFolder: backend.mode === 'local'
-        ? (outputFolder || undefined)
-        : MANGA_AIGATE_TEMP_OUTPUT_FOLDER,
-      batchSize,
-      configRevision: appliedConfig.revision,
-    }),
-    headers: {
-      'Content-Type': 'application/json',
-      ...(backend.mode === 'aigate' ? { 'X-Nonce': backend.nonce } : {}),
-    },
-    cache: 'no-store',
-  });
+  validEntries.forEach(entry => emitPageProgress(entry.pageIndex, 'prepare', 'running', 'submitting'));
+  let response;
+  try {
+    response = await fetch(`${backend.endpoint}/execute_image/batch_translate`, {
+      method: 'POST',
+      body: JSON.stringify({
+        images: validEntries,
+        taskId,
+        runId,
+        sourceUrl: normaliseMangaSourceUrl(sourceUrl),
+        outputFolder: backend.mode === 'local'
+          ? (outputFolder || undefined)
+          : MANGA_AIGATE_TEMP_OUTPUT_FOLDER,
+        configRevision: appliedConfig.revision,
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+        ...(backend.mode === 'aigate' ? { 'X-Nonce': backend.nonce } : {}),
+      },
+      cache: 'no-store',
+    });
+  } catch (error) {
+    validEntries.forEach(entry => emitPageProgress(entry.pageIndex, 'prepare', 'error', 'submit', error.message || String(error)));
+    throw error;
+  }
   if (!response.ok) {
     const detail = await response.text();
+    validEntries.forEach(entry => emitPageProgress(entry.pageIndex, 'prepare', 'error', 'submit', `HTTP ${response.status}`));
     throw new Error(`App 批量翻译桥接失败（HTTP ${response.status}）：${detail.slice(0, 240)}`);
   }
 
-  if (backend.mode === 'local') {
-    await readMangaBatchStream(response, event => {
-      if (!postMangaBatchEvent(port, event)) {
-        throw new Error('漫画翻译页面已离开，停止回传批量结果');
-      }
-    });
-    return;
-  }
-
   await readMangaBatchStream(response, async event => {
+    if (event.type === 'page-progress') {
+      const ok = emitPageProgress(
+        event.pageIndex,
+        event.stage,
+        event.state,
+        event.step,
+        event.error,
+        event.sequence,
+      );
+      if (!ok) throw new Error('漫画翻译页面已离开，停止回传批量结果');
+      return;
+    }
+    if (event.type === 'progress') return;
     if (event.type === 'result') {
+      const pageIndex = Number(event.pageIndex);
+      if (backend.mode === 'aigate') {
+        emitPageProgress(pageIndex, 'result', 'running', 'local-save');
+      } else {
+        emitPageProgress(pageIndex, 'result', 'running', 'apply-to-page');
+      }
       try {
-        const saved = await saveMangaTranslationLocally({
-          taskId,
-          pageIndex: Number(event.pageIndex),
-          sourceUrl,
-          imageUrl: validEntries.find(entry => entry.pageIndex === Number(event.pageIndex))?.imageUrl || '',
-          filename: event.filename,
-          imageBytes: event.data,
-          outputFolder,
-        });
-        event.savedPath = saved?.path || '';
+        if (backend.mode === 'aigate') {
+          const saved = await saveMangaTranslationLocally({
+            taskId,
+            pageIndex,
+            sourceUrl,
+            imageUrl: validEntries.find(entry => entry.pageIndex === pageIndex)?.imageUrl || '',
+            filename: event.filename,
+            imageBytes: event.data,
+            outputFolder,
+          });
+          if (!saved?.success) throw new Error(saved?.error || '本地缓存接口未确认保存翻译结果');
+          event.savedPath = saved?.path || '';
+          emitPageProgress(pageIndex, 'result', 'running', 'apply-to-page');
+        }
       } catch (error) {
+        emitPageProgress(pageIndex, 'result', 'error', 'local-save', error.message || String(error));
         event.type = 'error';
         event.error = error.message || String(error);
         event.stage = 'local-save';
         delete event.data;
       }
     }
-    if (!postMangaBatchEvent(port, event)) {
+    if (event.type === 'skipped') {
+      const pageIndex = Number(event.pageIndex);
+      ['recognize', 'translate', 'inpaint', 'render'].forEach(stage => {
+        emitPageProgress(pageIndex, stage, 'skipped', 'cache');
+      });
+      emitPageProgress(pageIndex, 'result', 'running', 'cache-restore');
+    } else if (event.type === 'error' && Number.isInteger(Number(event.pageIndex))) {
+      emitPageProgress(
+        Number(event.pageIndex),
+        event.stage === 'download' ? 'prepare' : 'result',
+        'error',
+        event.stage || 'backend-error',
+        event.error || '批量翻译失败',
+      );
+    }
+    if (!postEvent(event)) {
       throw new Error('漫画翻译页面已离开，停止回传批量结果');
     }
   });
@@ -866,7 +1012,7 @@ async function translateMangaImageInBackground(url, filename, options = {}) {
     await rememberMangaTask(options.sourceUrl, options.taskId, 1);
   }
   const backend = await ensureMangaTranslationBackend(outputFolder, {
-    reloadLocalConfig: options.reloadConfig === true,
+    reloadLocalConfig: false,
   });
   const appliedConfig = await applyMangaTranslatorConfig(backend);
   const sourceResponse = await fetch(url, { credentials: 'omit', cache: 'no-store' });
@@ -1317,16 +1463,17 @@ chrome.runtime.onConnect.addListener(port => {
   port.onMessage.addListener(request => {
     if (request.action === 'mangaBatchKeepAlive') return;
     if (request.action !== 'translateMangaBatchInPage') return;
-    if (!postMangaBatchMessage(port, { action: 'mangaBatchStarted', taskId: request.taskId })) return;
     translateMangaBatchInBackground(
       Array.isArray(request.entries) ? request.entries : [],
       request.sourceUrl || '',
       request.taskId || '',
-      Math.max(1, Math.min(Number(request.batchSize) || MANGA_BATCH_WINDOW_SIZE, MANGA_BATCH_WINDOW_SIZE)),
+      request.runId || '',
       port,
     ).catch(error => {
       postMangaBatchMessage(port, {
         action: 'mangaBatchFailed',
+        taskId: request.taskId || '',
+        runId: request.runId || '',
         error: error.message || String(error),
       });
     });
@@ -1428,12 +1575,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'prepareMangaTranslation') {
-    getMangaOutputFolder()
-      .then(outputFolder => ensureMangaTranslationBackend(outputFolder, {
-        reloadLocalConfig: true,
-        verifyCloud: true,
+    Promise.all([
+      getMangaOutputFolder(),
+      storageGet(['batch_size']),
+    ])
+      .then(async ([outputFolder, pluginSettings]) => {
+        const configuredBatchSize = Number(pluginSettings.batch_size);
+        const pluginBatchSize = Number.isFinite(configuredBatchSize)
+          ? Math.max(1, Math.min(Math.trunc(configuredBatchSize), MANGA_BATCH_WINDOW_SIZE))
+          : MANGA_DEFAULT_BATCH_SIZE;
+        const backend = await ensureMangaTranslationBackend(outputFolder, {
+          reloadLocalConfig: false,
+          verifyCloud: true,
+        });
+        return { backend, pluginBatchSize };
+      })
+      .then(({ backend, pluginBatchSize }) => sendResponse({
+        success: true,
+        backend: backend.mode,
+        pageProgressVersion: backend.pageProgressVersion || 0,
+        pluginBatchSize,
       }))
-      .then(backend => sendResponse({ success: true, backend: backend.mode }))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true;
   }
@@ -1459,14 +1621,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'getMangaCache') {
     const imageUrls = Array.isArray(request.imageUrls) ? request.imageUrls : [];
-    getMangaCache(request.taskId, request.sourceUrl, imageUrls)
+    getMangaCache(request.taskId, request.sourceUrl, imageUrls, request.outputFolder)
       .then(response => sendResponse(response))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true;
   }
 
   if (request.action === 'getMangaCachedImage') {
-    getMangaCachedImage(request.taskId, request.pageIndex, request.sourceUrl)
+    getMangaCachedImage(request.taskId, request.pageIndex, request.sourceUrl, request.outputFolder)
       .then(response => sendResponse(response))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true;
@@ -1494,7 +1656,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         imageUrls,
         autoStart: true,
       };
-    const targetUrl = `${chrome.runtime.getURL('manga/manga.html')}?pageData=${encodeURIComponent(JSON.stringify(pageData))}`;
+    const targetUrl = `${chrome.runtime.getURL('manga/workbench.html')}?pageData=${encodeURIComponent(JSON.stringify(pageData))}#standalone`;
     chrome.tabs.create({ url: targetUrl }, tab => {
       if (chrome.runtime.lastError) {
         sendResponse({ success: false, error: chrome.runtime.lastError.message });

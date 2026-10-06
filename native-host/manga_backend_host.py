@@ -1025,8 +1025,8 @@ bootstrap_personal_checkout() {{
     return 1
   fi
 
-  # Keep large models and the instance-local startup config from the existing
-  # persistent source directory without copying or committing either one.
+  # Keep large models, startup config, and credentials from the existing
+  # persistent source directory without copying or committing them.
   if [ "$source_root" != "$checkout_root" ]; then
     if [ -d "$source_root/models" ] && [ ! -e "$checkout_root/models" ] && [ ! -L "$checkout_root/models" ]; then
       ln -s "$source_root/models" "$checkout_root/models"
@@ -1036,6 +1036,11 @@ bootstrap_personal_checkout() {{
       && [ ! -L "$checkout_root/config/config.json" ]; then
       mkdir -p "$checkout_root/config"
       ln -s "$source_root/config/config.json" "$checkout_root/config/config.json"
+    fi
+    if [ -f "$source_root/.env" ] \
+      && [ ! -e "$checkout_root/.env" ] \
+      && [ ! -L "$checkout_root/.env" ]; then
+      ln -s "$source_root/.env" "$checkout_root/.env"
     fi
   fi
   printf '%s' "$checkout_root" > "$PROJECT_ROOT_FILE"
@@ -1179,7 +1184,7 @@ while True:
             info = json.loads(response.read().decode('utf-8'))
         if info.get('service') != 'manga-translator-ui' or info.get('mode') != 'shared':
             sys.exit(1)
-        if info.get('protocol') != 'manga-translator-ui-shared-v2' or int(info.get('configApiVersion') or 0) < 1:
+        if info.get('protocol') != 'manga-translator-ui-shared-v2' or int(info.get('configApiVersion') or 0) < 2:
             sys.exit(1)
         request = urllib.request.Request('http://127.0.0.1:6006/config')
         request.add_header('X-Nonce', sys.argv[1])
@@ -1231,7 +1236,7 @@ with urllib.request.urlopen(base + '/backend_info', timeout=5) as response:
     info = json.loads(response.read().decode('utf-8'))
 if info.get('service') != 'manga-translator-ui' or info.get('mode') != 'shared':
     sys.exit(1)
-if info.get('protocol') != 'manga-translator-ui-shared-v2' or int(info.get('configApiVersion') or 0) < 1:
+if info.get('protocol') != 'manga-translator-ui-shared-v2' or int(info.get('configApiVersion') or 0) < 2:
     sys.exit(1)
 if int(info.get('pid') or 0) != int(sys.argv[2]):
     sys.exit(1)
@@ -1305,6 +1310,10 @@ if [ "$SERVER_RUNNING" != 1 ]; then
   fi
   rm -f "$PID_FILE" "$NONCE_FILE"
   PROJECT_ROOT="$(cat "$PROJECT_ROOT_FILE" 2>/dev/null || true)"
+  PREFERRED_PROJECT_ROOT=/home/waas/manga-translator-ui
+  if [ -f "$PREFERRED_PROJECT_ROOT/manga_translator/__main__.py" ]; then
+    PROJECT_ROOT="$PREFERRED_PROJECT_ROOT"
+  fi
   PROJECT_FILE="$PROJECT_ROOT/manga_translator/__main__.py"
   if [ ! -f "$PROJECT_FILE" ]; then
     PROJECT_FILE="$(find /home/waas -maxdepth 6 -type f -path '*/manga-translator-ui/manga_translator/__main__.py' -print -quit 2>/dev/null || true)"
@@ -1598,7 +1607,7 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
                         config_api_version = int(info.get('configApiVersion') or 0)
                     except (TypeError, ValueError):
                         config_api_version = 0
-                    if config_api_version >= 1:
+                    if config_api_version >= 2:
                         config_request = Request(base_url + '/config', headers={'X-Nonce': nonce})
                         with urlopen(config_request, timeout=8) as response:
                             if response.status != 200:
@@ -1665,16 +1674,18 @@ def handle_request(request: dict, on_progress=None) -> dict:
         return _start_remote_shared_server(request, on_progress=on_progress)
     if action == 'aigateCheckTranslation':
         return _start_remote_shared_server(request, on_progress=on_progress, probe_only=True)
-    if action == 'aigateStopInstance':
+    if action in ('aigateStopInstance', 'aigateReleaseInstance'):
         token = str(request.get('token') or '').strip()
         instance_id = str(request.get('instanceId') or '').strip()
         if not token or not re.fullmatch(r'\d{6,32}', instance_id):
             return {'success': False, 'error': '请提供有效的云扉 Token 和实例 ID'}
+        operation = 'release' if action == 'aigateReleaseInstance' else 'close'
+        operation_label = '释放' if operation == 'release' else '关闭'
         try:
-            _aigate_module().control_instance(token, instance_id, 'close')
-            return {'success': True, 'instanceId': instance_id}
+            _aigate_module().control_instance(token, instance_id, operation)
+            return {'success': True, 'instanceId': instance_id, 'operation': operation}
         except Exception as error:
-            return {'success': False, 'error': f'关闭云扉实例失败：{error}'}
+            return {'success': False, 'error': f'{operation_label}云扉实例失败：{error}'}
     return {'success': False, 'error': '不支持的启动器操作'}
 
 

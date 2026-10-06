@@ -83,10 +83,13 @@ function initUI() {
   });
 
   document.getElementById('open-manga-translator').addEventListener('click', function() {
-    chrome.tabs.create({ url: chrome.runtime.getURL('manga/manga.html') });
+    chrome.tabs.create({ url: chrome.runtime.getURL('manga/workbench.html#plugin-config') });
   });
   document.getElementById('open-manga-config').addEventListener('click', function() {
-    chrome.tabs.create({ url: chrome.runtime.getURL('manga/config.html') });
+    chrome.tabs.create({ url: chrome.runtime.getURL('manga/workbench.html#manga-config') });
+  });
+  document.getElementById('open-manga-standalone').addEventListener('click', function() {
+    chrome.tabs.create({ url: chrome.runtime.getURL('manga/workbench.html#standalone') });
   });
 }
 
