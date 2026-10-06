@@ -166,7 +166,6 @@ body[data-view="plugin"] .images-panel { display: none; }
 body[data-view="plugin"] .page-shell { width: min(1360px, calc(100% - 40px)); padding: 24px 0 32px; }
 body[data-view="plugin"] .source-panel .panel-heading h2 { font-size: 17px; }
 body[data-view="plugin"] .plugin-batch-setting { display: block; }
-body[data-view="plugin"] .source-picker-actions,
 body[data-view="plugin"] .resume-task-box,
 body[data-view="plugin"] .file-drop,
 body[data-view="plugin"] .source-panel .form-grid label:nth-child(2),

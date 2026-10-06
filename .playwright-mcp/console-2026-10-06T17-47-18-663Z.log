@@ -1,1 +1,7 @@
 [     136ms] [ERROR] Failed to load resource: the server responded with a status of 404 (File not found) @ http://127.0.0.1:8765/favicon.ico:0
+[ 3035289ms] [VERBOSE] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o @ http://127.0.0.1:8765/manga/manga.html?view=standalone:0
+[ 3035292ms] [ERROR] Access to fetch at 'http://127.0.0.1:5003/logs?offset=0' from origin 'http://127.0.0.1:8765' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource. @ http://127.0.0.1:8765/manga/manga.html?view=standalone:0
+[ 3035294ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:5003/logs?offset=0:0
+[ 3035294ms] [ERROR] Access to fetch at 'http://127.0.0.1:5003/backend_info' from origin 'http://127.0.0.1:8765' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource. @ http://127.0.0.1:8765/manga/manga.html?view=standalone:0
+[ 3035294ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:5003/backend_info:0
+[ 3069091ms] [VERBOSE] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o @ http://127.0.0.1:8765/manga/manga.html?view=standalone:0

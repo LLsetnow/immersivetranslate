@@ -75,8 +75,6 @@
   const $ = selector => document.querySelector(selector);
   const fileInput = $('#chapter-html');
   const imageFilesInput = $('#image-files');
-  const chooseImagesButton = $('#choose-images');
-  const chooseHtmlButton = $('#choose-chapter-html');
   const logSourceInput = $('#backend-log-source');
   const pauseBackendLogButton = $('#pause-backend-log');
   const saveImagesButton = $('#save-translated-images');
@@ -2095,8 +2093,6 @@
     const file = event.dataTransfer.files?.[0];
     if (file) loadChapter(file).catch(error => setStatus(`HTML 读取失败：${error.message}`, 'error'));
   });
-  chooseImagesButton.addEventListener('click', () => imageFilesInput.click());
-  chooseHtmlButton.addEventListener('click', () => fileInput.click());
   imageFilesInput.addEventListener('change', event => {
     const files = Array.from(event.target.files || []);
     event.target.value = '';
