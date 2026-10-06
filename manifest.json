@@ -1,7 +1,7 @@
 {
     "name": "网页实时翻译",
     "description": "选中文本后点击右下角小点，使用阿里云翻译或本地引擎翻译",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "manifest_version": 2,
     "default_locale": "zh_CN",
     "permissions": [

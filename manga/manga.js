@@ -121,6 +121,10 @@
   const downloadButton = $('#download-html');
   const backendModeInput = $('#manga-backend-mode');
   const aigateControls = $('#aigate-controls');
+  const localControls = $('#local-controls');
+  const startLocalServiceButton = $('#start-local-service');
+  const testLocalServiceButton = $('#test-local-service');
+  const localServiceStatus = $('#local-service-status');
   const aigateTokenInput = $('#manga-aigate-token');
   const aigateAreaInput = $('#manga-aigate-area');
   const aigateSkuInput = $('#manga-aigate-sku');
@@ -1206,6 +1210,8 @@
     chooseOutputFolderButton.disabled = lifecycleBusy;
     startBackendButton.disabled = lifecycleBusy;
     testButton.disabled = lifecycleBusy;
+    if (startLocalServiceButton) startLocalServiceButton.disabled = lifecycleBusy;
+    if (testLocalServiceButton) testLocalServiceButton.disabled = lifecycleBusy;
     aigateSkuInput.disabled = lifecycleBusy || !skus.length;
     aigateImageInput.disabled = lifecycleBusy || !images.length;
     aigateInstanceInput.disabled = lifecycleBusy || !instances.length;
@@ -1226,6 +1232,9 @@
   function renderBackendMode() {
     state.backendMode = backendModeInput.value === 'aigate' ? 'aigate' : 'local';
     aigateControls.hidden = state.backendMode !== 'aigate';
+    if (localControls) localControls.hidden = state.backendMode !== 'local';
+    startBackendButton.hidden = state.backendMode === 'local';
+    testButton.hidden = state.backendMode === 'local';
     if (state.view === 'plugin') $('#source-panel-title').textContent = '本地服务与结果保存';
     const savedSummary = state.taskOutputFolder || state.outputFolder || '未设置（使用 App 当前输出目录）';
     if (standaloneSummary) standaloneSummary.textContent = `后端：${state.backendMode === 'aigate' ? 'AIGate 云端' : '本地 App'} · 保存目录：${savedSummary}`;
@@ -1287,6 +1296,12 @@
     }
   }
 
+  function updateLocalServiceStatus(text, kind = 'info') {
+    if (!localServiceStatus) return;
+    localServiceStatus.textContent = text;
+    localServiceStatus.dataset.kind = kind;
+  }
+
   async function probeLocalBridge() {
     try {
       const response = await fetch(`${DEFAULT_ENDPOINT}/backend_info`, { cache: 'no-store' });
@@ -1296,11 +1311,17 @@
         && info?.mode === 'shared'
         && info?.protocol === SHARED_BACKEND_PROTOCOL
         && info?.projectRoot === SHARED_BACKEND_PROJECT_ROOT;
-    } catch {
+      if (!state.localBridgeReady) throw new Error('5003 上的进程不是 manga-translator-ui 共享服务');
+      const pid = info?.pid ? ` · PID ${info.pid}` : '';
+      const api = info?.configApiVersion ? ` · 配置API v${info.configApiVersion}` : '';
+      updateLocalServiceStatus(`本地服务：已连接${pid}${api}`, 'success');
+    } catch (error) {
       state.localBridgeReady = false;
+      updateLocalServiceStatus(`本地服务：未连接（${error.message || error}）`, 'error');
     }
     if (state.backendMode === 'local') state.remoteServiceReady = state.localBridgeReady;
     reportBackendStatus();
+    return state.localBridgeReady;
   }
 
   async function refreshAigateResources() {
@@ -2160,6 +2181,7 @@
     reportBackendStatus();
     resetBackendLogCursor();
     await storageSet({ mangaBackendMode: state.backendMode });
+    if (state.backendMode === 'local') await probeLocalBridge();
     if (state.backendMode === 'aigate' && state.aigateToken) await refreshAigateResources();
   });
   aigateTokenInput.addEventListener('change', async () => {
@@ -2225,6 +2247,33 @@
   });
   testButton.addEventListener('click', testServer);
   startBackendButton.addEventListener('click', startBackend);
+  startLocalServiceButton.addEventListener('click', async () => {
+    if (state.running || state.paused || state.externalTaskActive) return;
+    startLocalServiceButton.disabled = true;
+    testLocalServiceButton.disabled = true;
+    setStatus('正在通过本机启动器启动本地服务…');
+    try {
+      const started = await startBackend({ silent: true });
+      await probeLocalBridge();
+      if (started && state.localBridgeReady) setStatus('本地服务已启动，可以开始翻译', 'success');
+    } finally {
+      startLocalServiceButton.disabled = false;
+      testLocalServiceButton.disabled = false;
+    }
+  });
+  testLocalServiceButton.addEventListener('click', async () => {
+    testLocalServiceButton.disabled = true;
+    setStatus('正在连接本地服务…');
+    try {
+      const connected = await probeLocalBridge();
+      setStatus(
+        connected ? '本地 App 核心桥接已连接' : '本地服务未连接：可点击“启动本地服务”后再测试',
+        connected ? 'success' : 'error',
+      );
+    } finally {
+      testLocalServiceButton.disabled = false;
+    }
+  });
   pauseTranslationButton.addEventListener('click', togglePause);
   translateButton.addEventListener('click', translateChapter);
   retryFailedButton.addEventListener('click', () => translateChapter({ retryFailed: true }));
@@ -2287,6 +2336,7 @@
     renderAigateResources();
     if (backendChanged) {
       reportBackendStatus();
+      if (state.backendMode === 'local') probeLocalBridge();
       if (state.backendMode === 'aigate' && state.view !== 'standalone') resetBackendLogCursor();
     }
   });

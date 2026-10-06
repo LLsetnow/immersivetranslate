@@ -61,6 +61,10 @@ input[type="url"]:focus, input[type="password"]:focus, input[type="number"]:focu
 .backend-mode-control select { width: 100%; }
 .aigate-controls { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
 .aigate-controls .form-grid { margin-top: 0; }
+.local-controls { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
+.local-actions { flex-wrap: wrap; justify-content: flex-start; }
+#local-service-status[data-kind="success"] { color: var(--success); }
+#local-service-status[data-kind="error"] { color: var(--danger); }
 .aigate-actions { flex-wrap: wrap; justify-content: flex-start; }
 #aigate-status[data-kind="success"] { color: var(--success); }
 #aigate-status[data-kind="error"] { color: var(--danger); }

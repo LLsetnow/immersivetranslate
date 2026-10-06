@@ -35,6 +35,13 @@
           <option value="aigate">AIGate 云端 GPU</option>
         </select>
       </div>
+      <div id="local-controls" class="local-controls">
+        <div class="toolbar local-actions">
+          <button id="start-local-service" class="button secondary" type="button">启动本地服务</button>
+          <button id="test-local-service" class="button secondary" type="button">测试连接</button>
+        </div>
+        <p id="local-service-status" class="hint" aria-live="polite">本地服务：未检查</p>
+      </div>
       <div id="aigate-controls" class="aigate-controls" hidden>
         <div class="form-grid">
           <label>
