@@ -11,9 +11,11 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -31,6 +33,152 @@ PROCESS_DIR_NAME = '.immersive-translate'
 TASK_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]{8,128}$')
 STARTUP_TIMEOUT_SECONDS = 90
 BRIDGE_ENDPOINT = 'http://127.0.0.1:5003'
+PERSONAL_MANGA_REPO_URL = 'https://github.com/LLsetnow/manga-translator-ui.git'
+
+
+def _run_git_command(arguments: list[str], *, timeout: int = 120, check: bool = True) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    try:
+        result = subprocess.run(
+            ['git', *arguments],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f'本机同步个人 GitHub 仓库超时（{timeout} 秒）') from error
+    if check and result.returncode != 0:
+        raise RuntimeError('无法从个人 manga-translator-ui GitHub 仓库读取最新提交')
+    return result
+
+
+def _personal_manga_remote(repo: Path) -> tuple[str, str]:
+    remotes = _run_git_command(['-C', str(repo), 'remote']).stdout.splitlines()
+    for name in remotes:
+        result = _run_git_command(['-C', str(repo), 'remote', 'get-url', name], check=False)
+        url = result.stdout.strip()
+        normalized = url.lower().removesuffix('.git').rstrip('/')
+        if normalized in {
+            'https://github.com/llsetnow/manga-translator-ui',
+            'git@github.com:llsetnow/manga-translator-ui',
+            'ssh://git@github.com/llsetnow/manga-translator-ui',
+        }:
+            return name, url
+    raise RuntimeError('本机 manga-translator-ui 未配置 LLsetnow/manga-translator-ui 个人仓库远端')
+
+
+def _prepare_personal_git_gateway(on_progress=None) -> dict:
+    if on_progress:
+        on_progress('正在从你的个人 GitHub 仓库获取最新提交…')
+    if _run_git_command(['-C', str(PROJECT_ROOT), 'rev-parse', '--is-inside-work-tree'], check=False).stdout.strip() != 'true':
+        raise RuntimeError('本机 manga-translator-ui 目录不是 Git 工作树，无法同步云端源码')
+
+    remote_name, remote_url = _personal_manga_remote(PROJECT_ROOT)
+    _run_git_command([
+        '-C', str(PROJECT_ROOT), 'fetch', '--quiet', '--prune', remote_name,
+        f'+refs/heads/*:refs/remotes/{remote_name}/*',
+    ])
+
+    default_ref_result = _run_git_command(
+        ['-C', str(PROJECT_ROOT), 'symbolic-ref', '--quiet', f'refs/remotes/{remote_name}/HEAD'],
+        check=False,
+    )
+    default_ref = default_ref_result.stdout.strip()
+    if not default_ref:
+        refs = _run_git_command(['ls-remote', '--symref', remote_url, 'HEAD']).stdout.splitlines()
+        default_ref = next(
+            (line.split()[1] for line in refs if line.startswith('ref: ') and line.endswith('\tHEAD')),
+            '',
+        )
+    prefix = f'refs/remotes/{remote_name}/'
+    if not default_ref.startswith(prefix):
+        raise RuntimeError('无法确定个人 manga-translator-ui 仓库的默认分支')
+    default_branch = default_ref[len(prefix):]
+    if not default_branch or default_branch.startswith('-'):
+        raise RuntimeError('个人 manga-translator-ui 仓库默认分支名称无效')
+
+    temporary_directory = tempfile.TemporaryDirectory(prefix='immersivetranslate-aigate-git-')
+    daemon = None
+    try:
+        temporary_root = Path(temporary_directory.name)
+        mirror_path = temporary_root / 'manga-translator-ui.git'
+        _run_git_command(['init', '--bare', '--quiet', str(mirror_path)])
+        source_prefix = f'refs/remotes/{remote_name}/'
+        source_refs = _run_git_command([
+            '-C', str(PROJECT_ROOT), 'for-each-ref', '--format=%(refname)',
+            source_prefix,
+        ]).stdout.splitlines()
+        refspecs = [
+            f'+{ref}:refs/heads/{ref[len(source_prefix):]}'
+            for ref in source_refs
+            if ref.startswith(source_prefix)
+            and not _run_git_command(['-C', str(PROJECT_ROOT), 'symbolic-ref', '--quiet', ref], check=False).stdout.strip()
+        ]
+        if not refspecs:
+            raise RuntimeError('个人 manga-translator-ui 仓库没有可同步的分支')
+        for refspec in refspecs:
+            source_ref, target_ref = refspec.lstrip('+').split(':', 1)
+            _run_git_command([
+                '-C', str(mirror_path), 'fetch', '--quiet', '--no-tags',
+                str(PROJECT_ROOT), f'+{source_ref}:{target_ref}',
+            ])
+        _run_git_command(['-C', str(mirror_path), 'symbolic-ref', 'HEAD', f'refs/heads/{default_branch}'])
+
+        with socket.socket() as port_socket:
+            port_socket.bind(('127.0.0.1', 0))
+            local_port = int(port_socket.getsockname()[1])
+        daemon = subprocess.Popen(
+            [
+                shutil.which('git') or 'git',
+                'daemon',
+                '--reuseaddr',
+                '--export-all',
+                '--max-connections=2',
+                '--init-timeout=15',
+                '--timeout=90',
+                '--listen=127.0.0.1',
+                f'--port={local_port}',
+                f'--base-path={temporary_directory}',
+                str(mirror_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if daemon.poll() is not None:
+                raise RuntimeError('无法启动本机只读 Git 同步服务')
+            try:
+                with socket.create_connection(('127.0.0.1', local_port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError('本机只读 Git 同步服务启动超时')
+
+        return {
+            'directory': temporary_directory,
+            'daemon': daemon,
+            'remoteName': remote_name,
+            'remoteUrl': remote_url,
+            'branch': default_branch,
+            'localPort': local_port,
+            'remotePort': secrets.randbelow(16000) + 40000,
+        }
+    except Exception:
+        if daemon and daemon.poll() is None:
+            daemon.terminate()
+            try:
+                daemon.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait(timeout=3)
+        temporary_directory.cleanup()
+        raise
 
 
 def write_message(message: dict) -> None:
@@ -756,12 +904,23 @@ def _service_base_url(service: dict) -> str:
     return 'https://' + authority
 
 
-def _remote_start_script(nonce: str, probe_only: bool = False) -> str:
+def _remote_start_script(
+    nonce: str,
+    probe_only: bool = False,
+    personal_git_url: str = '',
+    personal_git_branch: str = 'main',
+) -> str:
     nonce_base64 = base64.b64encode(nonce.encode('utf-8')).decode('ascii')
     probe_only_value = '1' if probe_only else '0'
+    personal_git_url_value = shlex.quote(personal_git_url)
+    personal_git_branch_value = shlex.quote(personal_git_branch)
+    personal_github_url_value = shlex.quote(PERSONAL_MANGA_REPO_URL)
     return f'''set -eu
 NONCE="$(printf '%s' {shlex.quote(nonce_base64)} | base64 -d)"
 PROBE_ONLY={probe_only_value}
+PERSONAL_GIT_REMOTE={personal_git_url_value}
+PERSONAL_GIT_BRANCH={personal_git_branch_value}
+PERSONAL_GITHUB_URL={personal_github_url_value}
 STATE_DIR=/tmp/immersive-translate
 PID_FILE="$STATE_DIR/shared-api.pid"
 NONCE_FILE="$STATE_DIR/shared-api.nonce"
@@ -814,17 +973,17 @@ PY
 
 run_git_clone() {{
   if command -v timeout >/dev/null 2>&1; then
-    timeout 150s env GIT_TERMINAL_PROMPT=0 git -c http.connectTimeout=20 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+    timeout 90s env GIT_TERMINAL_PROMPT=0 git "$@"
   else
-    env GIT_TERMINAL_PROMPT=0 git -c http.connectTimeout=20 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+    env GIT_TERMINAL_PROMPT=0 git "$@"
   fi
 }}
 
 run_git_pull() {{
   if command -v timeout >/dev/null 2>&1; then
-    timeout 120s env GIT_TERMINAL_PROMPT=0 git -c http.connectTimeout=20 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+    timeout 90s env GIT_TERMINAL_PROMPT=0 git "$@"
   else
-    env GIT_TERMINAL_PROMPT=0 git -c http.connectTimeout=20 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 "$@"
+    env GIT_TERMINAL_PROMPT=0 git "$@"
   fi
 }}
 
@@ -839,21 +998,25 @@ bootstrap_personal_checkout() {{
     echo 'IMT_STEP=clone-personal-repository' >&2
     temporary_root="$(mktemp -d "$checkout_parent/.manga-translator-ui.clone.XXXXXX")"
     rmdir "$temporary_root"
-    if run_git_clone clone --quiet --depth 1 --single-branch --origin personal https://github.com/LLsetnow/manga-translator-ui.git "$temporary_root"; then
+    if run_git_clone clone --quiet --depth 1 --single-branch --origin personal --branch "$PERSONAL_GIT_BRANCH" "$PERSONAL_GIT_REMOTE" "$temporary_root"; then
       :
     else
       clone_status="$?"
       rm -rf "$temporary_root"
       if [ "$clone_status" -eq 124 ]; then
-        echo 'AIGATE_ERROR=GitHub clone timed out after 150 seconds; check AIGate instance outbound access to github.com' >&2
+        echo 'AIGATE_ERROR=clone from the local GitHub mirror timed out after 90 seconds; check the SSH reverse tunnel' >&2
       else
-        echo 'AIGATE_ERROR=GitHub clone failed; check AIGate instance outbound access and the personal repository URL' >&2
+        echo 'AIGATE_ERROR=clone from the local GitHub mirror failed; check the SSH reverse tunnel and personal branch' >&2
       fi
       return 1
     fi
     if ! mv "$temporary_root" "$checkout_root"; then
       rm -rf "$temporary_root"
       echo 'AIGATE_ERROR=unable to install the personal manga-translator-ui checkout on the instance' >&2
+      return 1
+    fi
+    if ! git -C "$checkout_root" remote set-url personal "$PERSONAL_GITHUB_URL"; then
+      echo 'AIGATE_ERROR=unable to set the personal GitHub repository as the checkout upstream' >&2
       return 1
     fi
     SOURCE_UPDATED=1
@@ -915,14 +1078,14 @@ sync_project() {{
     return 1
   fi
   echo 'IMT_STEP=pull-personal-repository' >&2
-  if run_git_pull -C "$root" pull --ff-only --quiet "$remote_name" "$branch_name" >/dev/null 2>&1; then
+  if run_git_pull -C "$root" pull --ff-only --quiet "$PERSONAL_GIT_REMOTE" "$branch_name" >/dev/null 2>&1; then
     :
   else
     pull_status="$?"
     if [ "$pull_status" -eq 124 ]; then
-      echo 'AIGATE_ERROR=git pull timed out after 120 seconds; check AIGate instance outbound access to github.com' >&2
+      echo 'AIGATE_ERROR=git pull from the local GitHub mirror timed out after 90 seconds; check the SSH reverse tunnel' >&2
     else
-      echo 'AIGATE_ERROR=git pull --ff-only failed for the configured personal manga-translator-ui branch; check network, branch, and divergence' >&2
+      echo 'AIGATE_ERROR=git pull --ff-only from the personal GitHub mirror failed; check branch and divergence' >&2
     fi
     return 1
   fi
@@ -1237,6 +1400,7 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
     if not token or not re.fullmatch(r'\d{6,32}', instance_id):
         return {'success': False, 'error': '请提供有效的云扉 Token 和实例 ID'}
     aigate = _aigate_module()
+    git_gateway = None
     try:
         detail = aigate.get_instance_detail(token, instance_id)
         # AIGate 通常会在实例启动前返回镜像端口映射；能检查时先检查，
@@ -1246,6 +1410,8 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
             mapping_error = _service_mapping_error(detail)
             if mapping_error:
                 raise RuntimeError(mapping_error)
+        if not probe_only:
+            git_gateway = _prepare_personal_git_gateway(on_progress=on_progress)
         status = aigate.instance_status(detail)
         if probe_only:
             if status != '2':
@@ -1292,17 +1458,33 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
             '-o', 'ServerAliveInterval=15',
             '-o', 'ServerAliveCountMax=3',
             '-o', 'BatchMode=yes',
-            '-p', str(ssh_port),
-            f'root@{ssh_host}',
-            'bash -s',
         ]
+        if git_gateway and not probe_only:
+            ssh_args.extend([
+                '-o', 'ExitOnForwardFailure=yes',
+                '-R',
+                f"127.0.0.1:{git_gateway['remotePort']}:127.0.0.1:{git_gateway['localPort']}",
+            ])
+        ssh_args.extend(['-p', str(ssh_port), f'root@{ssh_host}', 'bash -s'])
         if on_progress:
             on_progress(
                 '正在通过 SSH 检查所选实例上的翻译服务…'
-                if probe_only else '正在同步你的 manga-translator-ui GitHub 分支，然后启动云端服务…'
+                if probe_only else '正在通过 SSH 隧道让云端从个人 GitHub 镜像执行 git pull，然后启动服务…'
             )
         env = os.environ.copy()
-        remote_script = _remote_start_script(nonce, probe_only=probe_only)
+        remote_git_url = ''
+        remote_git_branch = 'main'
+        if git_gateway and not probe_only:
+            remote_git_url = (
+                f"git://127.0.0.1:{git_gateway['remotePort']}/manga-translator-ui.git"
+            )
+            remote_git_branch = git_gateway['branch']
+        remote_script = _remote_start_script(
+            nonce,
+            probe_only=probe_only,
+            personal_git_url=remote_git_url,
+            personal_git_branch=remote_git_branch,
+        )
 
         def run_remote(command):
             try:
@@ -1321,8 +1503,8 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
                     captured = captured.decode('utf-8', errors='replace')
                 stages = {
                     'IMT_STEP=remote-shell-started': 'SSH 远端脚本已启动',
-                    'IMT_STEP=clone-personal-repository': '克隆个人 GitHub 仓库',
-                    'IMT_STEP=pull-personal-repository': '从个人 GitHub 仓库执行 git pull',
+                    'IMT_STEP=clone-personal-repository': '克隆个人 GitHub 镜像',
+                    'IMT_STEP=pull-personal-repository': '通过 SSH 隧道执行 git pull',
                     'IMT_STEP=verify-running-service-and-gpu': '检查现有服务和 CUDA',
                     'IMT_STEP=select-python-environment': '选择云端 Python 环境',
                     'IMT_STEP=verify-cuda-runtime': '初始化并检查 CUDA',
@@ -1372,6 +1554,8 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
             ]
             remote = run_remote([sshpass, '-e', ssh_command, *password_args])
         if remote.returncode != 0:
+            if 'remote port forwarding failed' in (remote.stderr or '').lower():
+                raise RuntimeError('AIGate SSH 未允许反向端口转发；无法通过本机安全镜像同步个人仓库')
             detail_text = (remote.stderr or remote.stdout or '').strip().splitlines()
             safe_detail = detail_text[-1][:240] if detail_text else f'SSH 退出码 {remote.returncode}'
             prefix = '检查云端翻译服务失败' if probe_only else '启动云端翻译服务失败'
@@ -1444,6 +1628,19 @@ def _start_remote_shared_server(request: dict, on_progress=None, probe_only: boo
         raise RuntimeError(f'AIGate 翻译服务未就绪：{last_error or "等待超时"}')
     except Exception as error:
         return {'success': False, 'error': str(error)}
+    finally:
+        if git_gateway:
+            daemon = git_gateway.get('daemon')
+            if daemon and daemon.poll() is None:
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    daemon.kill()
+                    daemon.wait(timeout=3)
+            directory = git_gateway.get('directory')
+            if directory:
+                directory.cleanup()
 
 
 def handle_request(request: dict, on_progress=None) -> dict:

@@ -797,7 +797,7 @@
       || !state.aigateToken
       || !state.aigateInstanceId;
     stopAigateButton.disabled = lifecycleBusy || !state.aigateInstanceId;
-    startAigateButton.title = '先从个人 GitHub manga-translator-ui 跟踪分支执行 git pull，再启动或更新 GPU 翻译服务';
+    startAigateButton.title = '本机先从个人 GitHub 同步默认分支，再通过 SSH 隧道让云端 git pull，之后启动 GPU 翻译服务';
     checkAigateServiceButton.title = '只检查已运行实例的仓库版本、GPU 环境和 HTTP 6006 连通性，不启动实例或拉取代码';
   }
 
@@ -811,7 +811,7 @@
     const note = $('#app-config-note');
     if (note) {
       note.textContent = state.backendMode === 'aigate'
-        ? '原图将上传到 AIGate；翻译结果回传后由本机共享服务写入所选目录和缓存清单。本地桥仅提供配置与缓存读写，不会执行本地翻译。启动云端服务前会从你的 manga-translator-ui GitHub 跟踪分支快进同步代码。'
+        ? '原图将上传到 AIGate；翻译结果回传后由本机共享服务写入所选目录和缓存清单。本地桥仅提供配置与缓存读写，不会执行本地翻译。本机启动前先从你的个人 GitHub 获取最新分支，再通过 SSH 只读隧道供云端 git pull 同步代码。'
         : '本地模式读取本机 manga-translator-ui/config/config.json；此模式不需要 Web 登录，翻译结果保存在所选输出目录。';
     }
   }
