@@ -1,13 +1,14 @@
 (function () {
   'use strict';
 
-  const routes = ['plugin-config', 'manga-config', 'standalone'];
+  const routes = ['plugin-config', 'manga-config', 'standalone', 'text-config'];
   const links = Array.from(document.querySelectorAll('[data-route]'));
   const pages = Array.from(document.querySelectorAll('[data-page]'));
   const frames = {
     'plugin-config': document.querySelector('[data-page="plugin-config"] iframe'),
     'manga-config': document.querySelector('[data-page="manga-config"] iframe'),
     standalone: document.getElementById('standalone-frame'),
+    'text-config': document.querySelector('[data-page="text-config"] iframe'),
   };
   const headerState = document.getElementById('header-state');
   const taskReturn = document.getElementById('task-return');

@@ -10,15 +10,11 @@
   const NATIVE_HOST_NAME = 'com.timecyber.immersivetranslate.manga_backend';
   const DEFAULT_PLUGIN_BATCH_SIZE = 10;
   const MIN_PLUGIN_BATCH_SIZE = 1;
-  const MAX_PLUGIN_BATCH_SIZE = 10;
 
   function normalizePluginBatchSize(value, fallback = DEFAULT_PLUGIN_BATCH_SIZE) {
     const numericValue = Number(value);
     if (!Number.isFinite(numericValue)) return fallback;
-    return Math.max(
-      MIN_PLUGIN_BATCH_SIZE,
-      Math.min(MAX_PLUGIN_BATCH_SIZE, Math.trunc(numericValue)),
-    );
+    return Math.max(MIN_PLUGIN_BATCH_SIZE, Math.trunc(numericValue));
   }
 
   const state = {

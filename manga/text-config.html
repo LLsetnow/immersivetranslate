@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文本翻译配置</title>
+  <link rel="stylesheet" href="manga.css">
+  <style>
+    body[data-embedded="true"] .hero { display: none; }
+    body[data-embedded="true"] .page-shell { padding-top: 18px; }
+    .text-config-shell { width: min(880px, calc(100% - 40px)); }
+    .credential-grid { display: grid; gap: 14px; margin-top: 6px; }
+    input[type="text"], input[type="password"] {
+      width: 100%; border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px;
+      color: #f5f7ff; outline: none; background: rgba(8, 11, 20, .45);
+    }
+    input[type="text"]:focus, input[type="password"]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(138, 168, 255, .14); }
+    html[data-theme="light"] input[type="text"], html[data-theme="light"] input[type="password"] { color: #202631; background: #fff; }
+    .config-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+    .config-status { margin: 12px 0 0; color: var(--muted); font-size: 13px; }
+    .config-status[data-kind="success"] { color: var(--success); }
+    .config-status[data-kind="error"] { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <main class="page-shell text-config-shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">网页与划词翻译 · TEXT TRANSLATION</p>
+        <h1>文本翻译配置</h1>
+        <p class="subtitle">配置扩展的网页与划词文本翻译。凭据只保存在本机扩展存储，不会写入源码、同步到浏览器账户或发送到本项目服务器。</p>
+      </div>
+    </header>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <h2>阿里云机器翻译</h2>
+          <p>普通网页翻译与划词翻译直接调用阿里云 <code>TranslateGeneral</code> 接口，单次请求最多 5000 字符。漫画图片翻译不使用这里的凭据，请在“漫画翻译配置”中设置。</p>
+        </div>
+      </div>
+      <div class="credential-grid">
+        <label>
+          <span>AccessKey ID</span>
+          <input type="text" id="aliyun-access-key-id" autocomplete="off" spellcheck="false" placeholder="例如 LTAI5t...">
+        </label>
+        <label>
+          <span>AccessKey Secret</span>
+          <input type="password" id="aliyun-access-key-secret" autocomplete="off" spellcheck="false" placeholder="仅保存在本机扩展存储">
+        </label>
+      </div>
+      <p class="hint">建议使用仅授权“机器翻译（alimt）”的 RAM 用户；免费额度与超额计费以阿里云控制台当前规则为准。</p>
+      <div class="config-actions">
+        <button class="button primary" id="save-text-config" type="button">保存配置</button>
+        <button class="button" id="test-text-config" type="button">测试连接</button>
+        <button class="button" id="clear-text-config" type="button">清空凭据</button>
+      </div>
+      <p id="text-config-status" class="config-status" aria-live="polite">正在读取本机配置…</p>
+    </section>
+  </main>
+  <script>
+    (function () {
+      'use strict';
+      const storage = typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local ? chrome.storage.local : null;
+      const runtime = typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage ? chrome.runtime : null;
+      const idInput = document.getElementById('aliyun-access-key-id');
+      const secretInput = document.getElementById('aliyun-access-key-secret');
+      const saveButton = document.getElementById('save-text-config');
+      const testButton = document.getElementById('test-text-config');
+      const clearButton = document.getElementById('clear-text-config');
+      const statusNode = document.getElementById('text-config-status');
+
+      document.body.dataset.embedded = new URLSearchParams(location.search).get('embedded') === '1' ? 'true' : 'false';
+      window.addEventListener('message', event => {
+        if (event.data && event.data.type === 'workbenchTheme') {
+          document.documentElement.dataset.theme = event.data.theme === 'light' ? 'light' : 'dark';
+        }
+      });
+
+      function setStatus(message, kind = 'info') {
+        statusNode.textContent = message;
+        if (kind === 'info') statusNode.removeAttribute('data-kind');
+        else statusNode.dataset.kind = kind;
+      }
+
+      if (!storage) {
+        saveButton.disabled = true;
+        testButton.disabled = true;
+        clearButton.disabled = true;
+        setStatus('未检测到扩展环境：请从扩展弹窗打开“漫画翻译”工作台后再配置。', 'error');
+        return;
+      }
+
+      storage.get(['aliyunAccessKeyId', 'aliyunAccessKeySecret'], result => {
+        idInput.value = result?.aliyunAccessKeyId || '';
+        secretInput.value = result?.aliyunAccessKeySecret || '';
+        setStatus(result?.aliyunAccessKeyId && result?.aliyunAccessKeySecret
+          ? '已读取本机保存的阿里云凭据。'
+          : '尚未配置凭据，填写后点击“保存配置”。');
+      });
+
+      saveButton.addEventListener('click', () => {
+        const accessKeyId = idInput.value.trim();
+        const accessKeySecret = secretInput.value.trim();
+        if (!accessKeyId || !accessKeySecret) {
+          setStatus('请先填写 AccessKey ID 和 AccessKey Secret。', 'error');
+          return;
+        }
+        storage.set({ aliyunAccessKeyId: accessKeyId, aliyunAccessKeySecret: accessKeySecret }, () => {
+          if (chrome.runtime.lastError) setStatus('保存失败：' + chrome.runtime.lastError.message, 'error');
+          else setStatus('已保存到本机扩展存储，网页与划词翻译立即生效。', 'success');
+        });
+      });
+
+      clearButton.addEventListener('click', () => {
+        storage.remove(['aliyunAccessKeyId', 'aliyunAccessKeySecret'], () => {
+          idInput.value = '';
+          secretInput.value = '';
+          setStatus('已清空本机保存的阿里云凭据。');
+        });
+      });
+
+      testButton.addEventListener('click', () => {
+        const accessKeyId = idInput.value.trim();
+        const accessKeySecret = secretInput.value.trim();
+        if (!accessKeyId || !accessKeySecret) {
+          setStatus('请先填写 AccessKey ID 和 AccessKey Secret。', 'error');
+          return;
+        }
+        if (!runtime) {
+          setStatus('当前页面没有扩展后台，无法测试连接。', 'error');
+          return;
+        }
+        testButton.disabled = true;
+        setStatus('正在测试阿里云连接…');
+        runtime.sendMessage({ action: 'testAliyun', credentials: { accessKeyId, accessKeySecret } }, response => {
+          testButton.disabled = false;
+          const lastError = chrome.runtime.lastError;
+          if (lastError) {
+            setStatus('测试失败：' + lastError.message, 'error');
+            return;
+          }
+          if (!response || !response.success) {
+            setStatus(response?.error || '测试失败；请确认凭据有效且网络可用。', 'error');
+            return;
+          }
+          setStatus('连接成功，示例译文：' + response.translation, 'success');
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
