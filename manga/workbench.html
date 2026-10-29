@@ -17,6 +17,7 @@
         <a href="#plugin-config" data-route="plugin-config">插件配置</a>
         <a href="#manga-config" data-route="manga-config">漫画翻译配置</a>
         <a href="#standalone" data-route="standalone">独立翻译</a>
+        <a href="#text-config" data-route="text-config">文本翻译配置</a>
       </nav>
       <div class="header-state" id="header-state"><span class="status-dot"></span><span>正在读取状态</span></div>
       <button class="theme-toggle" id="theme-toggle" type="button" aria-label="切换浅色主题">浅色</button>
@@ -31,6 +32,9 @@
       </section>
       <section class="workspace-page" data-page="standalone" aria-label="独立翻译" hidden>
         <iframe title="图片与漫画 HTML 翻译" id="standalone-frame"></iframe>
+      </section>
+      <section class="workspace-page" data-page="text-config" aria-label="文本翻译配置" hidden>
+        <iframe title="文本翻译配置（阿里云机器翻译）" src="text-config.html?embedded=1"></iframe>
       </section>
     </main>
 

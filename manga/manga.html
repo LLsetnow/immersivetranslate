@@ -128,9 +128,9 @@
       <div class="path-setting plugin-batch-setting">
         <label for="plugin-batch-size">
           <span>每次提交到翻译后端的图片数（batch_size）</span>
-          <input id="plugin-batch-size" name="batch_size" type="number" min="1" max="10" step="1" value="10" inputmode="numeric" aria-describedby="plugin-batch-size-help">
+          <input id="plugin-batch-size" name="batch_size" type="number" min="1" step="1" value="10" inputmode="numeric" aria-describedby="plugin-batch-size-help">
         </label>
-        <p id="plugin-batch-size-help">范围 1–10，默认 10。设置插件每次向翻译后端提交的图片数；后端每次把多少张图片原文合并发送给翻译器，由漫画翻译配置中的 cli.batch_size 控制。</p>
+        <p id="plugin-batch-size-help">最小 1，默认 10。设置插件每次向翻译后端提交的图片数；后端每次把多少张图片原文合并发送给翻译器，由漫画翻译配置中的 cli.batch_size 控制。</p>
         <p id="plugin-batch-size-status" class="plugin-setting-status" aria-live="polite">自动保存到插件配置</p>
       </div>
       <p id="standalone-summary" class="standalone-summary" hidden></p>

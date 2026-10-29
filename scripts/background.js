@@ -263,7 +263,6 @@ const MANGA_BACKEND_PROTOCOL = 'manga-translator-ui-shared-v2';
 const MANGA_BACKEND_PROJECT_ROOT = '/Users/apple/Documents/github/manga-translator-ui';
 const MANGA_AIGATE_TEMP_OUTPUT_FOLDER = '/tmp/immersive-translate-output';
 const MANGA_BACKEND_READY_TTL_MS = 30000;
-const MANGA_BATCH_WINDOW_SIZE = 10;
 const MANGA_DEFAULT_BATCH_SIZE = 10;
 let mangaBackendReadyUntil = 0;
 let mangaBackendProbePromise = null;
@@ -812,9 +811,6 @@ function postMangaBatchEvent(port, event) {
 }
 
 async function translateMangaBatchInBackground(entries, sourceUrl, taskId, runId, port) {
-  if (entries.length > MANGA_BATCH_WINDOW_SIZE) {
-    throw new Error(`单次批量翻译最多支持 ${MANGA_BATCH_WINDOW_SIZE} 张图片`);
-  }
   const outputFolder = await getMangaOutputFolder();
   await rememberMangaTask(sourceUrl, taskId, entries.length);
   const backend = await ensureMangaTranslationBackend(outputFolder, { reloadLocalConfig: false });
@@ -1585,7 +1581,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .then(async ([outputFolder, pluginSettings]) => {
         const configuredBatchSize = Number(pluginSettings.batch_size);
         const pluginBatchSize = Number.isFinite(configuredBatchSize)
-          ? Math.max(1, Math.min(Math.trunc(configuredBatchSize), MANGA_BATCH_WINDOW_SIZE))
+          ? Math.max(1, Math.trunc(configuredBatchSize))
           : MANGA_DEFAULT_BATCH_SIZE;
         const backend = await ensureMangaTranslationBackend(outputFolder, {
           reloadLocalConfig: false,

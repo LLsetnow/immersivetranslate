@@ -6,11 +6,14 @@
 
   const HOST_ID = '__immersive_translation_selection_ui__';
   const MAX_LENGTH = 5000;
-  const HIDE_DELAY_MS = 500;
+  const HIDE_DELAY_MS = 2500;
+  const CLICK_AWAY_DELAY_MS = 300;
+  const SELECTION_HOVER_PADDING = 8;
   let pendingText = '';
   let pendingRange = null;
   let selectionTimer = null;
   let hideTimer = null;
+  let hideTimerDelay = 0;
   let isTranslating = false;
   let translationToken = 0;
   let repositionFrame = null;
@@ -55,13 +58,13 @@
         }
         .trigger-shell[hidden], .card-shell[hidden] { display: none; }
         .trigger {
-          width: 14px;
-          height: 14px;
+          width: 10px;
+          height: 10px;
           padding: 0;
           border: 0;
           border-radius: 50%;
           background: #8aa8ff;
-          box-shadow: 0 0 0 4px rgba(138, 168, 255, .18), 0 6px 18px rgba(15, 23, 42, .35);
+          box-shadow: 0 0 0 3px rgba(138, 168, 255, .18), 0 5px 14px rgba(15, 23, 42, .32);
           cursor: pointer;
           pointer-events: auto;
           transition: transform .18s ease, background .18s ease;
@@ -127,7 +130,11 @@
       event.preventDefault();
       event.stopPropagation();
     });
-    trigger.addEventListener('pointerenter', () => translatePending(shadow));
+    trigger.addEventListener('pointerenter', () => {
+      cancelScheduledHide();
+      translatePending(shadow);
+    });
+    shadow.querySelector('.card').addEventListener('pointerenter', () => cancelScheduledHide());
     trigger.addEventListener('click', startFromPointer);
     shadow.addEventListener('click', event => {
       const action = event.target.closest('[data-action]')?.dataset.action;
@@ -155,10 +162,10 @@
   function isPointInsideSelection(clientX, clientY) {
     if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
     return getSelectionRects(pendingRange).some(rect => (
-      clientX >= rect.left - 2 &&
-      clientX <= rect.right + 2 &&
-      clientY >= rect.top - 2 &&
-      clientY <= rect.bottom + 2
+      clientX >= rect.left - SELECTION_HOVER_PADDING &&
+      clientX <= rect.right + SELECTION_HOVER_PADDING &&
+      clientY >= rect.top - SELECTION_HOVER_PADDING &&
+      clientY <= rect.bottom + SELECTION_HOVER_PADDING
     ));
   }
 
@@ -167,14 +174,20 @@
       window.clearTimeout(hideTimer);
       hideTimer = null;
     }
+    hideTimerDelay = 0;
   }
 
-  function scheduleHide(shadow) {
-    if (hideTimer !== null) return;
+  function scheduleHide(shadow, delay = HIDE_DELAY_MS) {
+    if (hideTimer !== null) {
+      if (delay >= hideTimerDelay) return;
+      window.clearTimeout(hideTimer);
+    }
+    hideTimerDelay = delay;
     hideTimer = window.setTimeout(() => {
       hideTimer = null;
+      hideTimerDelay = 0;
       hideAll(shadow);
-    }, HIDE_DELAY_MS);
+    }, delay);
   }
 
   function isUIVisible(shadow) {
@@ -210,17 +223,17 @@
     const rect = getSelectionRect(pendingRange);
     if (!rect) return;
 
-    const triggerSize = 14;
-    const gap = 8;
+    const triggerSize = 10;
     const viewportPadding = 8;
-    let left = rect.right + gap;
-    let top = rect.bottom + gap;
+    // 贴着选区末尾：横向与选区右边缘对齐居中，纵向让圆点上沿贴住选区底边。
+    let left = rect.right - triggerSize / 2;
+    let top = rect.bottom;
 
     if (left + triggerSize > window.innerWidth - viewportPadding) {
-      left = rect.left - triggerSize - gap;
+      left = rect.right - triggerSize - triggerSize / 2;
     }
     if (top + triggerSize > window.innerHeight - viewportPadding) {
-      top = rect.top - triggerSize - gap;
+      top = rect.top - triggerSize - triggerSize / 2;
     }
 
     setShellPosition(
@@ -382,12 +395,17 @@
     const eventPath = typeof event.composedPath === 'function' ? event.composedPath() : [];
     const clickedInsideHost = host && (host.contains(event.target) || eventPath.includes(host));
     if (host && !clickedInsideHost && isUIVisible(host.shadowRoot)) {
-      scheduleHide(host.shadowRoot);
+      scheduleHide(host.shadowRoot, CLICK_AWAY_DELAY_MS);
     }
   }, true);
 
   document.addEventListener('pointermove', handlePointerMove, true);
 
-  window.addEventListener('scroll', repositionVisibleUI, true);
+  window.addEventListener('scroll', event => {
+    const host = document.getElementById(HOST_ID);
+    // 卡片内部滚动时不重新定位（否则卡片会跟着滚出鼠标位置，触发误关闭）。
+    if (host && (event.target === host || host.contains(event.target))) return;
+    repositionVisibleUI();
+  }, true);
   window.addEventListener('resize', repositionVisibleUI);
 })();

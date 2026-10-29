@@ -5,19 +5,24 @@
   if (window.top !== window.self || !document.documentElement) return;
 
   const IMAGE_PATTERN = /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#].*)?$/i;
-  const MANGA_BATCH_WINDOW_SIZE = 10;
+  const DEFAULT_PLUGIN_BATCH_SIZE = 10;
   const EIGHTEEN_COMIC_BODY_IMAGE_SELECTOR = '.scramble-page:not(.thewayhome) > img';
   const EIGHTEEN_COMIC_IMAGE_ATTRIBUTES = ['data-original', 'data-src', 'data-lazy-src', 'src'];
   const state = {
     running: false,
     paused: false,
-    pluginBatchSize: MANGA_BATCH_WINDOW_SIZE,
+    pluginBatchSize: DEFAULT_PLUGIN_BATCH_SIZE,
     nextChapterRunning: false,
     cacheChecking: false,
     entries: [],
     translated: 0,
     failed: 0,
     taskId: '',
+    cacheRestoreQueue: [],
+    cacheRestorePending: new Set(),
+    cacheRestoreIdleWaiters: [],
+    cacheRestoreRunning: false,
+    cacheRestoreEpoch: 0,
     cacheRestored: false,
     cacheAvailable: false,
     showingOriginal: false,
@@ -34,8 +39,8 @@
   function applyPreparedPluginBatchSize(ready) {
     const value = Number(ready?.pluginBatchSize);
     state.pluginBatchSize = Number.isFinite(value)
-      ? Math.max(1, Math.min(MANGA_BATCH_WINDOW_SIZE, Math.trunc(value)))
-      : MANGA_BATCH_WINDOW_SIZE;
+      ? Math.max(1, Math.trunc(value))
+      : DEFAULT_PLUGIN_BATCH_SIZE;
     return state.pluginBatchSize;
   }
 
@@ -443,11 +448,14 @@
   function resolveLiveImageElement(entry) {
     const liveImages = getLiveImageElements();
     const cacheKey = normaliseImageCacheKey(entry.url);
-    const exact = liveImages.find(image => imageAttributeUrls(image).some(candidate => (
-      candidate === entry.url
-      || (is18ComicBodyImageUrl(entry.url)
-        && normaliseImageCacheKey(candidate) === cacheKey)
-    )));
+    const exact = liveImages.find(image => (
+      image.dataset?.immersiveSource === entry.url
+      || imageAttributeUrls(image).some(candidate => (
+        candidate === entry.url
+        || (is18ComicBodyImageUrl(entry.url)
+          && normaliseImageCacheKey(candidate) === cacheKey)
+      ))
+    ));
     if (exact) return exact;
     if (is18ComicPhotoPage()) {
       const pageIndex = state.entries.indexOf(entry);
@@ -460,6 +468,7 @@
     }
     if (entry.element?.isConnected && (
       imageAttributeUrls(entry.element).includes(entry.url)
+      || entry.element.dataset?.immersiveSource === entry.url
       || (is18ComicPhotoPage() && entry.element.matches?.(EIGHTEEN_COMIC_BODY_IMAGE_SELECTOR))
     )) {
       return entry.element;
@@ -587,7 +596,7 @@
     state.taskId = createTaskId(sourceUrl, imageUrls);
     const nextChapterUrl = buildManga18NextChapterUrl(manga18ChapterInfo);
 
-    function markEntrySucceeded(entry, { cached = false } = {}) {
+    function markEntrySucceeded(entry, { cached = false, quiet = false } = {}) {
       const wasFailed = entry.failed === true;
       const wasCompleted = entry.completed === true;
       entry.completed = true;
@@ -605,7 +614,9 @@
         cached,
       );
       updateAverageTime();
-      setStatus(`已完成 ${state.translated} / ${state.entries.length}：${entry.name}`, 'success');
+      if (!quiet) {
+        setStatus(`已完成 ${state.translated} / ${state.entries.length}：${entry.name}`, 'success');
+      }
     }
 
     function markEntryFailed(entry, error) {
@@ -715,17 +726,8 @@
 
           if (message.action === 'mangaBatchImageSkipped' && entry && !settledIndexes.has(pageIndex)) {
             settledIndexes.add(pageIndex);
-            queueResultHandler(entry, async () => {
-              const cached = await sendMessage({
-                action: 'getMangaCachedImage',
-                taskId: state.taskId,
-                pageIndex,
-                sourceUrl,
-              });
-              if (!cached.success) throw new Error(cached.error || '读取批量缓存图片失败');
-              await replaceImage(entry, cached);
-              markEntrySucceeded(entry, { cached: true });
-            });
+            // 交给独立的缓存恢复线程处理，不再占用批量翻译的消息通道。
+            enqueueCacheRestore(entry, pageIndex);
             return;
           }
 
@@ -809,7 +811,7 @@
           );
           await sleep(400 + attempt * 600);
           try {
-            const recovered = await restoreCachedEntries(pendingEntries);
+            const recovered = await restoreCachedEntries(pendingEntries, null, { wait: true });
             pendingEntries = recovered.pendingEntries;
           } catch (recoveryError) {
             console.warn('[漫画翻译] 批量断线后的缓存恢复失败，将直接重试:', recoveryError);
@@ -1551,11 +1553,43 @@
     return { symbol: presentation[0], label: presentation[1], detail, stateName };
   }
 
+  let progressTableBatchKey = '';
+  const progressTableRowCache = new Map();
+
   function renderProgressTable(task) {
-    const indexes = task.batchPageIndices.slice(0, MANGA_BATCH_WINDOW_SIZE);
+    const indexes = task.batchPageIndices;
+    const batchKey = [task.taskId, task.currentRunId, indexes.join(',')].join('|');
     const focusedRow = shadow.activeElement?.closest?.('.progress-row');
     const focusedPage = Number(focusedRow?.dataset.pageIndex);
-    progressRowsNode.replaceChildren();
+
+    if (batchKey !== progressTableBatchKey) {
+      progressTableBatchKey = batchKey;
+      progressTableRowCache.clear();
+      progressRowsNode.replaceChildren();
+      indexes.forEach(pageIndex => {
+        const page = task.pages.get(pageIndex);
+        if (!page) return;
+        const row = document.createElement('tr');
+        row.className = 'progress-row';
+        row.tabIndex = 0;
+        row.setAttribute('role', 'button');
+        row.dataset.pageIndex = String(pageIndex);
+        const pageCell = document.createElement('td');
+        pageCell.textContent = `第 ${pageIndex + 1} 页`;
+        row.appendChild(pageCell);
+        const iconByStage = new Map();
+        PROGRESS_STAGES.forEach(stageName => {
+          const cell = document.createElement('td');
+          const icon = document.createElement('span');
+          cell.appendChild(icon);
+          row.appendChild(cell);
+          iconByStage.set(stageName, icon);
+        });
+        progressTableRowCache.set(pageIndex, { row, iconByStage });
+        progressRowsNode.appendChild(row);
+      });
+    }
+
     const preferredPage = state.selectedProgressPage?.taskId === task.taskId
       ? Number(state.selectedProgressPage.pageIndex)
       : Number(state.selectedProgressPage?.pageIndex);
@@ -1567,34 +1601,24 @@
       }
     }
     indexes.forEach(pageIndex => {
+      const cached = progressTableRowCache.get(pageIndex);
       const page = task.pages.get(pageIndex);
-      if (!page) return;
-      const row = document.createElement('tr');
-      row.className = 'progress-row';
-      row.tabIndex = 0;
-      row.setAttribute('role', 'button');
-      row.dataset.pageIndex = String(pageIndex);
-      row.dataset.selected = String(pageIndex === selectedKey);
-      const pageCell = document.createElement('td');
-      pageCell.textContent = `第 ${pageIndex + 1} 页`;
-      row.appendChild(pageCell);
+      if (!cached || !page) return;
+      cached.row.dataset.selected = String(pageIndex === selectedKey);
       PROGRESS_STAGES.forEach(stageName => {
-        const cell = document.createElement('td');
         const stage = page.stages[stageName];
         const stateInfo = getProgressStatePresentation(stageName, stage);
-        const icon = document.createElement('span');
+        const icon = cached.iconByStage.get(stageName);
         icon.className = `progress-state${stateInfo.stateName === 'running' ? ' progress-spinner' : ''}`;
         icon.dataset.state = stateInfo.stateName === 'unavailable' ? 'skipped' : stateInfo.stateName;
         icon.textContent = stateInfo.symbol;
         icon.title = `${PROGRESS_STAGE_LABELS[stageName]}：${stateInfo.detail}`;
-        cell.appendChild(icon);
-        row.appendChild(cell);
       });
-      progressRowsNode.appendChild(row);
     });
+
     if (Number.isInteger(focusedPage) && indexes.includes(focusedPage)) {
       try {
-        progressRowsNode.querySelector(`[data-page-index="${focusedPage}"]`)?.focus({ preventScroll: true });
+        progressTableRowCache.get(focusedPage)?.row.focus({ preventScroll: true });
       } catch (_) {
         // Focus restoration is only for keeping keyboard selection stable during live updates.
       }
@@ -2130,6 +2154,8 @@
     ['data-src', 'data-original', 'data-lazy-src'].forEach(attribute => {
       entry.element.removeAttribute(attribute);
     });
+    // 记住原始地址：译图/缓存图就位后站点属性已被清掉，再次应用（重新翻译、恢复与翻译并发）时仍要能找回同一个 <img>。
+    entry.element.dataset.immersiveSource = entry.url;
     if (state.showingOriginal) {
       delete entry.element.dataset.immersiveTranslated;
     } else {
@@ -2182,7 +2208,75 @@
     }).filter(Boolean);
   }
 
-  async function restoreCachedEntries(entries, cachePayload = null) {
+  function cancelPendingCacheRestores() {
+    state.cacheRestoreEpoch += 1;
+    state.cacheRestoreQueue = [];
+    state.cacheRestorePending.clear();
+  }
+
+  function enqueueCacheRestore(entry, pageIndex, epoch = state.cacheRestoreEpoch) {
+    if (!entry || entry.completed === true) return false;
+    const index = Number.isInteger(pageIndex) ? pageIndex : state.entries.indexOf(entry);
+    if (!Number.isInteger(index) || index < 0) return false;
+    if (state.cacheRestorePending.has(entry)) return false;
+    state.cacheRestorePending.add(entry);
+    state.cacheRestoreQueue.push({ entry, pageIndex: index, epoch });
+    state.cacheRestoreQueue.sort((left, right) => left.pageIndex - right.pageIndex);
+    void runCacheRestoreWorker();
+    return true;
+  }
+
+  function waitForCacheRestoreIdle() {
+    if (!state.cacheRestoreRunning && !state.cacheRestoreQueue.length) return Promise.resolve();
+    return new Promise(resolve => {
+      state.cacheRestoreIdleWaiters.push(resolve);
+    });
+  }
+
+  // 独立的缓存恢复线程：自带队列，不占用批量翻译的消息通道，也不依赖 state.running。
+  // 翻译开始后缓存恢复仍在后台继续；正在恢复中的页面会从翻译批次里排除，避免重复处理。
+  async function runCacheRestoreWorker() {
+    if (state.cacheRestoreRunning) return;
+    state.cacheRestoreRunning = true;
+    try {
+      while (state.cacheRestoreQueue.length) {
+        const { entry, pageIndex, epoch } = state.cacheRestoreQueue.shift();
+        try {
+          if (epoch !== state.cacheRestoreEpoch || entry.completed === true) continue;
+          const cached = await sendMessage({
+            action: 'getMangaCachedImage',
+            taskId: state.taskId,
+            pageIndex,
+            sourceUrl,
+          });
+          if (!cached.success) throw new Error(cached.error || '读取缓存图片失败');
+          if (epoch !== state.cacheRestoreEpoch || entry.completed === true) continue;
+          await replaceImage(entry, cached);
+          if (epoch !== state.cacheRestoreEpoch || entry.completed === true) continue;
+          markEntrySucceeded(entry, { cached: true, quiet: state.running });
+          if (!state.running) {
+            setStatus(`已恢复缓存 ${state.translated} / ${state.entries.length} 页`, 'success');
+          }
+        } catch (error) {
+          // 恢复失败不阻塞翻译：该页保持未完成，可以正常翻译或稍后重试。
+          console.warn(`[漫画翻译] 缓存第 ${pageIndex + 1} 页恢复失败:`, error);
+        } finally {
+          state.cacheRestorePending.delete(entry);
+        }
+      }
+    } finally {
+      state.cacheRestoreRunning = false;
+      const waiters = state.cacheRestoreIdleWaiters.splice(0);
+      waiters.forEach(resolve => resolve());
+      setRunningControls();
+    }
+  }
+
+  async function restoreCachedEntries(
+    entries,
+    cachePayload = null,
+    { wait = false, epoch = state.cacheRestoreEpoch } = {},
+  ) {
     const cache = cachePayload || await sendMessage({
       action: 'getMangaCache',
       taskId: state.taskId,
@@ -2195,28 +2289,17 @@
       .filter(item => entries.includes(item.entry) && item.entry.completed !== true);
     if (cache.found && pages.length) state.cacheAvailable = true;
 
-    let restored = 0;
-    for (const item of restorablePages.sort((left, right) => left.pageIndex - right.pageIndex)) {
-      const { entry, entryIndex, pageIndex } = item;
-      try {
-        const cached = await sendMessage({
-          action: 'getMangaCachedImage',
-          taskId: state.taskId,
-          pageIndex,
-          sourceUrl,
-        });
-        if (!cached.success) throw new Error(cached.error || '读取缓存图片失败');
-        await replaceImage(entry, cached);
-        markEntrySucceeded(entry, { cached: true });
-        restored += 1;
-        setStatus(`已恢复缓存 ${state.translated} 页`, 'success');
-      } catch (error) {
-        markEntryFailed(entry, new Error(`缓存第 ${entryIndex + 1} 页恢复失败：${error.message}`));
-      }
-    }
+    let queued = 0;
+    restorablePages
+      .sort((left, right) => left.pageIndex - right.pageIndex)
+      .forEach(item => {
+        if (enqueueCacheRestore(item.entry, item.pageIndex, epoch)) queued += 1;
+      });
+    if (wait && queued) await waitForCacheRestoreIdle();
     return {
       found: Boolean(cache.found && pages.length),
-      restored,
+      queued,
+      restored: restorablePages.filter(item => item.entry.completed === true).length,
       pendingEntries: entries.filter(entry => entry.completed !== true),
     };
   }
@@ -2235,13 +2318,18 @@
       if (!cache.found || !restorablePages.length) return;
 
       state.cacheAvailable = true;
-      state.running = true;
-      setRunningControls();
+      // 页面图片可能在脚本初始化后才就绪。先等缓存目标可以安全定位，避免首次
+      // 打开时恢复线程过早替换失败，随后又要靠重新提交批次触发 skipped 才恢复。
       setStatus(`发现上次翻译缓存，正在等待章节图片加载…`, 'success');
-      await waitForAllLiveImageElements(state.entries);
+      await waitForAllLiveImageElements(restorablePages.map(item => item.entry));
       setStatus(`发现上次翻译缓存，正在恢复 ${restorablePages.length} 页…`, 'success');
-      await restoreCachedEntries(restorablePages.map(item => item.entry), cache);
+      await restoreCachedEntries(
+        restorablePages.map(item => item.entry),
+        cache,
+        { wait: true, epoch: state.cacheRestoreEpoch },
+      );
       state.cacheRestored = state.translated > 0;
+      if (state.running) return;
       const incompleteCount = getIncompleteEntries().length;
       if (state.cacheAvailable) {
         setStatus(
@@ -2256,7 +2344,6 @@
       // prevent the user from starting a new translation manually.
       console.warn('[漫画翻译] 缓存检查失败，将继续使用实时翻译:', error);
     } finally {
-      state.running = false;
       state.cacheChecking = false;
       setRunningControls();
     }
@@ -2270,7 +2357,11 @@
       }
       if (!state.running) break;
       const batch = entries.slice(offset, offset + pluginBatchSize)
-        .filter(entry => entry && entry.completed !== true);
+        .filter(entry => (
+          entry
+          && entry.completed !== true
+          && !state.cacheRestorePending.has(entry)
+        ));
       if (!batch.length) continue;
       const firstIndex = state.entries.indexOf(batch[0]);
       const lastIndex = state.entries.indexOf(batch[batch.length - 1]);
@@ -2283,6 +2374,8 @@
 
   async function translateCurrentPage() {
     if (state.running) return;
+    // 整章重新翻译时丢弃排队中的缓存恢复，避免恢复结果和新的翻译结果互相覆盖。
+    cancelPendingCacheRestores();
     setActiveProgressTask(currentProgressTask.taskId);
     currentProgressTask.currentRunId = '';
     currentProgressTask.batchPageIndices = [];
@@ -2320,7 +2413,11 @@
       await processEntries(state.entries);
 
       if (state.running) {
-        setStatus(`处理完成：${state.translated} / ${state.entries.length} 页成功${state.failed ? `，${state.failed} 页失败` : ''}`, state.failed ? 'error' : 'success');
+        const restoringCount = state.cacheRestorePending.size;
+        setStatus(
+          `处理完成：${state.translated} / ${state.entries.length} 页成功${state.failed ? `，${state.failed} 页失败` : ''}${restoringCount ? `，缓存恢复中 ${restoringCount} 页` : ''}`,
+          state.failed ? 'error' : 'success',
+        );
       }
     } catch (error) {
       setStatus(error.message || '网页漫画翻译失败', 'error');
@@ -2397,10 +2494,13 @@
       startProcessingClock();
       await processEntries(incompleteEntries, { retry: true });
       if (state.running) {
+        const restoringNote = state.cacheRestorePending.size
+          ? `，缓存恢复中 ${state.cacheRestorePending.size} 页`
+          : '';
         setStatus(
           state.failed
-            ? `继续完成后仍有 ${state.failed} 页失败`
-            : `已继承缓存并完成：${state.translated} / ${state.entries.length} 页`,
+            ? `继续完成后仍有 ${state.failed} 页失败${restoringNote}`
+            : `已继承缓存并完成：${state.translated} / ${state.entries.length} 页${restoringNote}`,
           state.failed ? 'error' : 'success',
         );
       }
@@ -2478,7 +2578,9 @@
   window.addEventListener('immersive-translation-trigger-change', schedulePanelPosition);
   document.addEventListener('selectionchange', schedulePanelPosition, { passive: true });
   positionPanel(false);
-  state.cacheChecking = Boolean(manga18ChapterInfo);
+  // Cache discovery and first restore must finish before a manual translation
+  // can race it and consume the same cached pages through the batch path.
+  state.cacheChecking = true;
   setRunningControls();
   restoreCachedResults();
   }
